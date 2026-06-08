@@ -5,7 +5,9 @@ import { config } from './config';
 import type { Pixels, Processed } from './types';
 
 async function loadLogo(): Promise<ImageBitmap> {
-  const res = await fetch(`${base}/${config.logoFile}`);
+  const url = `${base}/${config.logoFile}`;
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`failed to load logo ${url}: ${res.status}`);
   return createImageBitmap(await res.blob());
 }
 

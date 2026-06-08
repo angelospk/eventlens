@@ -39,10 +39,17 @@ export default {
       const publicUrl = `${env.PUBLIC_BASE}/${key}`;
 
       // Reserve the row up front. INSERT OR IGNORE so a retried /sign is idempotent.
-      await env.DB.prepare(
+      const insertRes = await env.DB.prepare(
         `INSERT OR IGNORE INTO photos (id, r2_key, public_url, event_date, original_name, status)
          VALUES (?,?,?,?,?,'pending')`
       ).bind(id, key, publicUrl, eventDate, originalName ?? null).run();
+
+      // If the row already existed and is confirmed, refuse to re-sign (no overwrite of a finished upload).
+      if ((insertRes.meta.changes ?? 0) === 0) {
+        const existing = await env.DB.prepare(`SELECT status FROM photos WHERE id = ?`)
+          .bind(id).first<{ status: string }>();
+        if (existing?.status === 'confirmed') return json({ error: 'already confirmed' }, env, 409);
+      }
 
       const target = `https://${env.R2_ACCOUNT_ID}.r2.cloudflarestorage.com/${env.R2_BUCKET}/${key}`;
       const client = new AwsClient({
@@ -62,7 +69,7 @@ export default {
     if (url.pathname === '/meta' && req.method === 'POST') {
       const m = await req.json<{ id: string; original_name?: string; width: number; height: number; bytes: number }>();
       if (!/^[\w-]{8,}$/.test(m.id)) return json({ error: 'bad input' }, env, 400);
-      if (![m.width, m.height, m.bytes].every((n) => Number.isFinite(n))) return json({ error: 'bad input' }, env, 400);
+      if (![m.width, m.height, m.bytes].every((n) => Number.isFinite(n) && n > 0)) return json({ error: 'bad input' }, env, 400);
       const res = await env.DB.prepare(
         `UPDATE photos SET width=?, height=?, bytes=?, original_name=COALESCE(?, original_name), status='confirmed'
          WHERE id=?`
