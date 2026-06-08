@@ -8,7 +8,7 @@ export interface ManagerDeps {
 
 export async function fetchList(deps: ManagerDeps, date: string): Promise<PhotoListItem[]> {
   const f = deps.fetchImpl ?? fetch;
-  const res = await f(`${deps.workerUrl}/list?date=${date}`, {
+  const res = await f(`${deps.workerUrl}/list?date=${encodeURIComponent(date)}`, {
     method: 'GET',
     headers: { 'x-manager-passcode': deps.passcode }
   });

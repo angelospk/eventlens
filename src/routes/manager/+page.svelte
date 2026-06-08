@@ -62,9 +62,9 @@
     <p>{photos.length} φωτογραφίες</p>
     <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:8px">
       {#each photos as p (p.id)}
-        <button type="button" onclick={() => onDownload(p)} title={`Κατέβασμα ${p.original_name}`}
+        <button type="button" onclick={() => onDownload(p)} title={`Κατέβασμα ${p.original_name ?? p.id}`}
                 style="border:none;background:none;cursor:pointer;padding:0">
-          <img src={p.public_url} alt={p.original_name} loading="lazy"
+          <img src={p.public_url} alt={p.original_name ?? p.id} loading="lazy"
                style="width:100%;height:160px;object-fit:cover;border-radius:4px" />
         </button>
       {/each}

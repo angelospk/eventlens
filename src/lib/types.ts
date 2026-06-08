@@ -48,7 +48,7 @@ export interface SignResult { uploadUrl: string; publicUrl: string; key: string;
 export interface PhotoListItem {
   id: string;
   public_url: string;
-  original_name: string;
+  original_name: string | null;
   width: number;
   height: number;
   bytes: number;
