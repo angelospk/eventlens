@@ -1,0 +1,7 @@
+node_modules/
+.svelte-kit/
+build/
+.dev.vars
+.wrangler/
+dist/
+.DS_Store
