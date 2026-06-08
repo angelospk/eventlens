@@ -45,7 +45,7 @@
 
 {#if !loggedIn}
   <form onsubmit={(e) => { e.preventDefault(); login(); }}>
-    <input type="password" bind:value={passcode} placeholder="Manager passcode" />
+    <input type="password" bind:value={passcode} placeholder="Manager passcode" aria-label="Manager passcode" />
     <button type="submit">Είσοδος</button>
   </form>
 {:else}
