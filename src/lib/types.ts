@@ -43,3 +43,14 @@ export interface PhotoMeta {
 
 // Returned by /sign.
 export interface SignResult { uploadUrl: string; publicUrl: string; key: string; }
+
+// Returned by GET /list — one confirmed photo's metadata for the manager grid.
+export interface PhotoListItem {
+  id: string;
+  public_url: string;
+  original_name: string;
+  width: number;
+  height: number;
+  bytes: number;
+  created_at: string;
+}
