@@ -41,3 +41,25 @@ test('marks error after maxAttempts and keeps item for manual retry', async () =
   expect(items[0].status).toBe('error');
   expect(items[0].attempts).toBe(3);
 });
+
+test('a persistently-failing item does not block a good item behind it', async () => {
+  const store = new MemStore();
+  const order: string[] = [];
+  const uploader = {
+    async run(it: QueueItem) {
+      order.push(it.id);
+      if (it.id === 'bad') throw new Error('always fails');
+      // 'good' succeeds
+    }
+  };
+  const q = new UploadQueue(store, uploader, { baseMs: 50, maxMs: 50, maxAttempts: 3 }, () => {});
+  await q.enqueue(item('bad'));
+  await q.enqueue(item('good'));
+  await q.drain();
+  // 'good' must have uploaded (removed) even though 'bad' keeps failing.
+  const remaining = await store.all();
+  expect(remaining.map((i) => i.id)).toEqual(['bad']); // only the failed one remains
+  expect(remaining[0].status).toBe('error');
+  expect(q.completed).toBe(1);
+  expect(order).toContain('good');
+});

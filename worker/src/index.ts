@@ -62,6 +62,7 @@ export default {
     if (url.pathname === '/meta' && req.method === 'POST') {
       const m = await req.json<{ id: string; original_name?: string; width: number; height: number; bytes: number }>();
       if (!/^[\w-]{8,}$/.test(m.id)) return json({ error: 'bad input' }, env, 400);
+      if (![m.width, m.height, m.bytes].every((n) => Number.isFinite(n))) return json({ error: 'bad input' }, env, 400);
       const res = await env.DB.prepare(
         `UPDATE photos SET width=?, height=?, bytes=?, original_name=COALESCE(?, original_name), status='confirmed'
          WHERE id=?`

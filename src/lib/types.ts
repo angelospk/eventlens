@@ -21,6 +21,7 @@ export interface QueueItem {
   status: ItemStatus;
   attempts: number;
   lastError?: string;
+  nextAttemptAt?: number; // epoch ms; item is not retried before this (backoff without blocking the queue)
   // populated after processing:
   avif?: Blob;
   width?: number;

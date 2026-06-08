@@ -10,6 +10,7 @@
   let passcode = $state('');
   let loggedIn = $state(false);
   let items = $state<QueueItem[]>([]);
+  let completed = $state(0);
   let queue: UploadQueue;
   let store: IdbStore;
 
@@ -19,7 +20,7 @@
     return new Date(d.getTime() - d.getTimezoneOffset() * 60000).toISOString().slice(0, 10);
   }
 
-  async function refresh() { items = await store.all(); }
+  async function refresh() { items = await store.all(); completed = queue?.completed ?? 0; }
 
   function login() {
     store = new IdbStore();
@@ -50,8 +51,6 @@
     return () => window.removeEventListener('online', on);
   });
 
-  // done = items with status 'done'; queue removes successful items, so this is usually 0 (MVP acceptable)
-  const done = $derived(items.filter((i) => i.status === 'done').length);
 </script>
 
 {#if !loggedIn}
@@ -61,7 +60,7 @@
   </form>
 {:else}
   <input type="file" accept="image/*" multiple onchange={onPick} />
-  <p>{items.length - done} σε εξέλιξη · {done} ολοκληρώθηκαν</p>
+  <p>{items.length} σε ουρά · {completed} ανέβηκαν</p>
   <ul>
     {#each items as it (it.id)}
       <li>{it.originalName} — {it.status}{#if it.status === 'error'} ⚠ {it.lastError}{/if}</li>

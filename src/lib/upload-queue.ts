@@ -25,12 +25,16 @@ function isRunnable(i: QueueItem, maxAttempts: number): boolean {
 export class UploadQueue {
   private running = false;
   private dirty = false;
+  private _completed = 0;
   constructor(
     private store: QueueStore,
     private uploader: Uploader,
     private retry: RetryPolicy,
     private onChange: () => void = () => {}
   ) {}
+
+  /** Number of items successfully uploaded this session (they are removed from the store). */
+  get completed() { return this._completed; }
 
   async enqueue(item: QueueItem) {
     await this.store.add(item);
@@ -52,10 +56,16 @@ export class UploadQueue {
         do {
           this.dirty = false;
           for (;;) {
-            const items = await this.store.all();
-            const next = items.find((i) => isRunnable(i, this.retry.maxAttempts));
-            if (!next) break;
-            await this.process(next);
+            const items = (await this.store.all()).filter((i) => isRunnable(i, this.retry.maxAttempts));
+            if (items.length === 0) break;
+            const now = Date.now();
+            // Prefer an item whose backoff has elapsed (or never failed).
+            const ready = items.find((i) => !i.nextAttemptAt || i.nextAttemptAt <= now);
+            if (ready) { await this.process(ready); continue; }
+            // All runnable items are still in backoff: wait until the soonest, then loop.
+            // (A newly-enqueued item has no nextAttemptAt, so it would have been 'ready'.)
+            const soonest = Math.min(...items.map((i) => i.nextAttemptAt as number));
+            await sleep(Math.max(0, soonest - now));
           }
         } while (this.dirty); // an enqueue happened mid-drain → another pass
       } finally {
@@ -72,14 +82,17 @@ export class UploadQueue {
     try {
       await this.uploader.run(it);
       await this.store.remove(it.id); // success → drop from queue
-    } catch (e) {
-      const status = attempts >= this.retry.maxAttempts ? 'error' : 'pending';
-      await this.store.update(it.id, { status, lastError: String(e) });
+      this._completed++;
       this.onChange();
-      if (status === 'pending') {
-        const backoff = Math.min(this.retry.maxMs, this.retry.baseMs * 2 ** (attempts - 1));
-        await sleep(backoff);
-      }
+    } catch (e) {
+      const failed = attempts >= this.retry.maxAttempts;
+      const backoff = Math.min(this.retry.maxMs, this.retry.baseMs * 2 ** (attempts - 1));
+      await this.store.update(it.id, {
+        status: failed ? 'error' : 'pending',
+        lastError: String(e),
+        nextAttemptAt: failed ? undefined : Date.now() + backoff
+      });
+      this.onChange();
     }
   }
 }
