@@ -1,0 +1,33 @@
+{
+	"name": "eventlens",
+	"private": true,
+	"version": "0.0.1",
+	"type": "module",
+	"scripts": {
+		"dev": "vite dev",
+		"build": "vite build",
+		"preview": "vite preview",
+		"test": "bun test",
+		"prepare": "svelte-kit sync || echo ''",
+		"check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
+		"check:watch": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json --watch"
+	},
+	"devDependencies": {
+		"@cloudflare/workers-types": "^4.20260608.1",
+		"@sveltejs/adapter-auto": "^7.0.1",
+		"@sveltejs/adapter-static": "^3.0.10",
+		"@sveltejs/kit": "^2.57.0",
+		"@sveltejs/vite-plugin-svelte": "^7.0.0",
+		"fake-indexeddb": "^6.2.5",
+		"svelte": "^5.55.2",
+		"svelte-check": "^4.4.6",
+		"typescript": "^6.0.2",
+		"vite": "^8.0.7",
+		"wrangler": "^4.98.0"
+	},
+	"dependencies": {
+		"@jsquash/avif": "^2.1.1",
+		"aws4fetch": "^1.0.20",
+		"uuid": "^14.0.0"
+	}
+}
