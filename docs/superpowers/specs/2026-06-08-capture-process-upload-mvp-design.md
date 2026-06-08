@@ -29,15 +29,20 @@ logo (στην πιο «ήσυχη» γωνία) + ένα brand φίλτρο, σ
 
 | Στρώμα | Επιλογή | Σημείωση |
 |--------|---------|----------|
-| Frontend | **SvelteKit, πλήρως static** | Hostable σε GitHub Pages ή Cloudflare Pages |
+| Frontend | **SvelteKit, πλήρως static** (`adapter-static` v3.x) | Hostable σε GitHub Pages ή Cloudflare Pages |
+| Package manager | **bun** | Όχι npm |
 | Επεξεργασία εικόνας | **Στον browser** (canvas + WASM) | Όπως squoosh — μηδέν server load |
-| Codec | **AVIF** (WASM encoder) | Ακριβής lib προς επιβεβαίωση (έρευνα) |
+| Codec | **AVIF** via `@jsquash/avif` (~2.1.x, libavif) | quality 70, effort 5 |
 | Αποθήκευση εικόνων | **Cloudflare R2** (free 10GB) | Public URLs, γρήγορο serving |
 | Metadata | **Cloudflare D1** (free SQLite) | Σχήμα ως migration σε κώδικα |
-| Backend | **Cloudflare Worker** | passcode auth + presigned URL + meta write |
+| Backend | **Cloudflare Worker** + `aws4fetch` | passcode auth + presigned URL + meta write |
 | Auth | **Κοινός passcode** | Ελέγχεται στον Worker |
 
 Όλα σε **ένα Cloudflare account**. Δεν χρησιμοποιείται PocketBase στο MVP.
+
+**Όρια D1 free tier (επιβεβαιωμένα Ιουν. 2026):** 10 DBs/account, 500 MB/DB, 5 GB/account,
+5M rows read/μέρα, 100k rows written/μέρα. Migrations με `wrangler d1 migrations create|apply`
+(δημιουργεί `migrations/` folder + `d1_migrations` tracking table) — τεράστια περιθώρια για metadata.
 
 ### Ροή
 
@@ -73,8 +78,10 @@ logo (στην πιο «ήσυχη» γωνία) + ένα brand φίλτρο, σ
 - **Εξαρτήσεις:** `quiet-corner`, WASM AVIF encoder.
 - **Φίλτρο MVP:** ένα σταθερό color grade (π.χ. contrast/saturation/warmth) με brand τιμές
   σε ένα config — εύκολο να αλλάξει, configurable presets αργότερα.
-- **Διατήρηση ανάλυσης:** δεν μειώνουμε διαστάσεις· μόνο AVIF συμπίεση. (Προαιρετικό μέγιστο
-  edge cap προς επιβεβαίωση στην έρευνα ποιότητας.)
+- **AVIF settings:** quality **70**, effort **5** (balance size/ποιότητας/χρόνου).
+- **Διατήρηση ανάλυσης:** **default = καμία μείωση διαστάσεων** (τιμάμε το «να μη χάνουμε
+  ανάλυση»). Προαιρετικό max-long-edge cap (π.χ. 4000px) **απενεργοποιημένο by default**,
+  διαθέσιμο ως config αν χρειαστεί.
 
 ### `upload-queue`
 - **Τι κάνει:** persistent ουρά σε **IndexedDB**. Σειριακό upload μία-μία. Retry με
@@ -152,15 +159,17 @@ CREATE INDEX idx_photos_event_date ON photos(event_date);
 
 ---
 
-## Ανοιχτά σημεία (χρειάζονται έρευνα του χρήστη)
+## Κλειδωμένες τεχνικές αποφάσεις (από έρευνα, Ιουν. 2026)
 
-1. **AVIF WASM encoder lib** — υποψήφιος `@jsquash/avif`. Πιο πρόσφατη/συντηρούμενη επιλογή;
-2. **Presigned R2 URL από Worker** — τρέχον σωστό pattern (aws4fetch / S3 API του R2).
-3. **Όρια D1 free tier** — επιβεβαίωση τρεχόντων ορίων.
-4. **AVIF ποιότητα** — προτεινόμενο quality setting / τυχόν max-dimension για ισορροπία
-   μεγέθους/ποιότητας.
-
-(Prompt έρευνας θα δοθεί χωριστά.)
+- **AVIF encoder:** `@jsquash/avif` (~2.1.x, libavif). Encode μέσω `ImageData` (από
+  `createImageBitmap` + canvas `getImageData`). Single-thread build για ευρεία συμβατότητα.
+- **Presigned R2:** Worker με `aws4fetch` → `AwsClient.sign(..., { aws: { signQuery: true } })`,
+  service `s3`, region `auto`. Expiry ~3600s. **CORS στο bucket** για browser PUT.
+  R2 creds + passcode hash ως **Worker secrets**.
+- **D1:** όρια & migrations όπως πάνω.
+- **AVIF ποιότητα:** quality 70, effort 5· χωρίς downscale by default.
+- **SvelteKit:** `@sveltejs/adapter-static` v3.x. Όλα τα routes prerendered· κανένα server
+  `+server.js`/server load (το backend είναι ο Worker). Προσοχή σε `base` path για GitHub Pages.
 
 ---
 
