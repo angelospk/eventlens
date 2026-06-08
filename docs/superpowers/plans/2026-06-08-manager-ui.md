@@ -75,6 +75,8 @@ git add src/lib/types.ts && git commit -m "feat: PhotoListItem type for manager 
 
 - [ ] **Step 1: Replace the whole `worker/src/index.ts` with the version below**
 
+> FIRST diff the version below against the current `worker/src/index.ts` to confirm the only differences are the intended ones (no existing route/validation silently dropped). The snippet IS the complete intended file — but verify before overwriting.
+
 The changes vs. current: add `MANAGER_PASSCODE` to `Env`; `cors()` allows `GET` and the `x-manager-passcode` header; the global photographer-passcode guard is removed and auth is applied **per route** (`/sign` and `/meta` require `x-passcode`; `/list` requires `x-manager-passcode`); add the `/list` handler.
 
 ```ts
@@ -102,7 +104,7 @@ function cors(env: Env) {
 }
 
 const json = (o: unknown, env: Env, status = 200) =>
-  new Response(JSON.stringify(o), { status, headers: { 'content-type': 'application/json', ...cors(env) } });
+  new Response(JSON.stringify(o), { status, headers: { 'content-type': 'application/json', 'cache-control': 'no-store', ...cors(env) } });
 
 export default {
   async fetch(req: Request, env: Env): Promise<Response> {
@@ -146,7 +148,8 @@ export default {
       return json({ uploadUrl: signed.url, publicUrl, key }, env);
     }
 
-    // /meta — photographer only. Confirm an existing pending row; client cannot inject key/url/date.
+    // /meta — photographer only. Confirm an existing PENDING row; cannot inject key/url/date
+    // and cannot overwrite an already-confirmed photo (WHERE ... status='pending').
     if (url.pathname === '/meta' && req.method === 'POST') {
       if (!isPhotographer) return json({ error: 'unauthorized' }, env, 401);
       const m = await req.json<{ id: string; original_name?: string; width: number; height: number; bytes: number }>();
@@ -154,9 +157,9 @@ export default {
       if (![m.width, m.height, m.bytes].every((n) => Number.isFinite(n) && n > 0)) return json({ error: 'bad input' }, env, 400);
       const res = await env.DB.prepare(
         `UPDATE photos SET width=?, height=?, bytes=?, original_name=COALESCE(?, original_name), status='confirmed'
-         WHERE id=?`
+         WHERE id=? AND status='pending'`
       ).bind(m.width, m.height, m.bytes, m.original_name ?? null, m.id).run();
-      if ((res.meta.changes ?? 0) === 0) return json({ error: 'unknown id' }, env, 404);
+      if ((res.meta.changes ?? 0) === 0) return json({ error: 'unknown or already-confirmed id' }, env, 404);
       return json({ ok: true }, env);
     }
 
@@ -164,7 +167,8 @@ export default {
     if (url.pathname === '/list' && req.method === 'GET') {
       if (!isManager) return json({ error: 'unauthorized' }, env, 401);
       const date = url.searchParams.get('date') ?? '';
-      if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return json({ error: 'bad input' }, env, 400);
+      // Syntactic shape AND a real calendar date (rejects e.g. 9999-99-99).
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(date) || Number.isNaN(Date.parse(date))) return json({ error: 'bad input' }, env, 400);
       const { results } = await env.DB.prepare(
         `SELECT id, public_url, original_name, width, height, bytes, created_at
          FROM photos WHERE event_date = ? AND status = 'confirmed' ORDER BY created_at`
@@ -268,7 +272,8 @@ export async function downloadPhoto(item: PhotoListItem): Promise<void> {
   const objUrl = URL.createObjectURL(blob);
   const a = document.createElement('a');
   a.href = objUrl;
-  a.download = `${item.original_name.replace(/\.[^./]+$/, '')}.avif`;
+  const base = (item.original_name || item.id).replace(/\.[^./]+$/, '');
+  a.download = `${base}.avif`;
   document.body.appendChild(a);
   a.click();
   a.remove();
@@ -420,6 +425,14 @@ bunx wrangler secret put MANAGER_PASSCODE   # interactive; user picks the value
 # update R2 CORS to add GET/HEAD (see DEPLOY.md)
 bunx wrangler deploy
 ```
+
+- [ ] **Step 4: Manual end-to-end smoke checklist** (after deploy)
+
+  - `GET /list?date=…` with **wrong** manager passcode → `401`.
+  - correct manager passcode → only `confirmed` photos for that date.
+  - `GET /list?date=9999-99-99` → `400`.
+  - `/sign` and `/meta` still reject wrong/missing **photographer** passcode (regression).
+  - On deployed `/manager`: grid renders, clicking a photo downloads the blob (proves R2 GET CORS).
 
 ---
 
