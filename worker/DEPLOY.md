@@ -21,3 +21,16 @@ For the GitHub Pages build, set VITE_WORKER_URL to the deployed Worker URL — e
 Also set the [vars] PUBLIC_BASE and ALLOWED_ORIGIN in wrangler.toml to the real R2 public base and the GitHub Pages origin before `wrangler deploy`.
 
 Define the VITE_WORKER_URL Actions repository variable in GitHub → Settings → Secrets and variables → Actions → Variables so the CI build picks it up automatically.
+
+## Manager UI (sub-project 2)
+# New secret for manager access:
+bunx wrangler secret put MANAGER_PASSCODE
+
+# Extend R2 bucket CORS to allow GET (for fetch-to-download) in addition to PUT.
+# Write rules to a temp JSON and apply (do not commit the file):
+#   { "rules": [ { "allowed": { "origins": ["https://angelospk.github.io"],
+#       "methods": ["GET","PUT","HEAD"], "headers": ["content-type"] }, "maxAgeSeconds": 3600 } ] }
+bunx wrangler r2 bucket cors set eventlens --file <rules.json>
+
+# Redeploy the worker with the new /list endpoint:
+bunx wrangler deploy
