@@ -5,12 +5,13 @@ compatibility_date = "2026-01-01"
 [[d1_databases]]
 binding = "DB"
 database_name = "eventlens"
-database_id = "REPLACE_AFTER_CREATE"
+database_id = "f25bd292-10d6-47c7-958a-9572af46e723"
 migrations_dir = "worker/migrations"
 
 # Secrets (set via `wrangler secret put`):
-#   PASSCODE, R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY
+#   PASSCODE, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY
 [vars]
 R2_BUCKET = "eventlens"
+R2_ACCOUNT_ID = "aec2a7c0bf16c5229ab4790e5bf3100f"
 PUBLIC_BASE = "https://REPLACE.r2.dev"            # public bucket / custom domain
-ALLOWED_ORIGIN = "https://REPLACE.github.io"      # exact deployed app origin
+ALLOWED_ORIGIN = "https://angelospk.github.io"    # exact deployed app origin (GitHub Pages)
