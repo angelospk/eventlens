@@ -13,5 +13,5 @@ migrations_dir = "worker/migrations"
 [vars]
 R2_BUCKET = "eventlens"
 R2_ACCOUNT_ID = "aec2a7c0bf16c5229ab4790e5bf3100f"
-PUBLIC_BASE = "https://REPLACE.r2.dev"            # public bucket / custom domain
+PUBLIC_BASE = "https://pub-8cc0fc35edf94016a199f64267c2bb34.r2.dev"  # public bucket dev URL
 ALLOWED_ORIGIN = "https://angelospk.github.io"    # exact deployed app origin (GitHub Pages)
