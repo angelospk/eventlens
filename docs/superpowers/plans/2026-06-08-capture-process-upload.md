@@ -162,16 +162,20 @@ export interface QueueItem {
   bytes?: number;
 }
 
+export interface Processed { avif: Blob; width: number; height: number; bytes: number; }
+
+// Sent to /meta. The server already knows r2_key/public_url from /sign;
+// the client only confirms the upload + reports dimensions.
 export interface PhotoMeta {
   id: string;
-  r2_key: string;
-  public_url: string;
-  event_date: string;
   original_name: string;
   width: number;
   height: number;
   bytes: number;
 }
+
+// Returned by /sign.
+export interface SignResult { uploadUrl: string; publicUrl: string; key: string; }
 ```
 
 - [ ] **Step 2: `src/lib/config.ts`**
@@ -180,7 +184,8 @@ export interface PhotoMeta {
 export const config = {
   // Cloudflare Worker base URL (set per environment via PUBLIC env in real deploy)
   workerUrl: import.meta.env?.VITE_WORKER_URL ?? 'http://localhost:8787',
-  logoPath: '/logo.png',
+  // logo path is resolved against the SvelteKit base path at call sites (see processor):
+  logoFile: 'logo.png',
   avif: { quality: 70, effort: 5 },
   // Brand color grade applied via canvas filter string:
   filter: 'contrast(1.05) saturate(1.12) brightness(1.02)',
@@ -390,8 +395,15 @@ export interface RetryPolicy { baseMs: number; maxMs: number; maxAttempts: numbe
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
+// Runnable = waiting to be tried, or left mid-flight by a crash/reload.
+// 'error' items are NOT auto-retried (manual retry only); 'done' are removed.
+function isRunnable(i: QueueItem, maxAttempts: number): boolean {
+  return (i.status === 'pending' || i.status === 'uploading') && i.attempts < maxAttempts;
+}
+
 export class UploadQueue {
   private running = false;
+  private dirty = false;
   constructor(
     private store: QueueStore,
     private uploader: Uploader,
@@ -404,23 +416,32 @@ export class UploadQueue {
     this.onChange();
   }
 
-  /** Process pending/error items one-by-one until none are runnable. */
+  // Cross-tab single-flight via Web Locks (no-op in non-browser test env).
+  private withLock<T>(fn: () => Promise<T>): Promise<T> {
+    const locks = (globalThis as any).navigator?.locks;
+    return locks?.request ? locks.request('eventlens-upload', fn) : fn();
+  }
+
+  /** Process runnable items one-by-one until none remain. Safe to call repeatedly. */
   async drain() {
-    if (this.running) return;
-    this.running = true;
-    try {
-      for (;;) {
-        const items = await this.store.all();
-        const next = items.find(
-          (i) => i.status !== 'done' && i.attempts < this.retry.maxAttempts
-        );
-        if (!next) break;
-        await this.process(next);
+    if (this.running) { this.dirty = true; return; } // re-pass after current loop
+    await this.withLock(async () => {
+      this.running = true;
+      try {
+        do {
+          this.dirty = false;
+          for (;;) {
+            const items = await this.store.all();
+            const next = items.find((i) => isRunnable(i, this.retry.maxAttempts));
+            if (!next) break;
+            await this.process(next);
+          }
+        } while (this.dirty); // an enqueue happened mid-drain → another pass
+      } finally {
+        this.running = false;
+        this.onChange();
       }
-    } finally {
-      this.running = false;
-      this.onChange();
-    }
+    });
   }
 
   private async process(it: QueueItem) {
@@ -527,10 +548,22 @@ export class IdbStore implements QueueStore {
 
   async add(item: QueueItem) { await tx(await this.dbp, 'readwrite', (s) => s.put(item)); }
 
+  // Read-modify-write inside ONE readwrite transaction to avoid lost updates
+  // (e.g. processor writing avif/bytes racing with retry writing status/attempts).
   async update(id: string, patch: Partial<QueueItem>) {
     const db = await this.dbp;
-    const cur = await tx<QueueItem>(db, 'readonly', (s) => s.get(id) as IDBRequest<QueueItem>);
-    await tx(db, 'readwrite', (s) => s.put({ ...cur, ...patch }));
+    await new Promise<void>((resolve, reject) => {
+      const t = db.transaction(STORE, 'readwrite');
+      const s = t.objectStore(STORE);
+      const getReq = s.get(id);
+      getReq.onsuccess = () => {
+        const cur = getReq.result as QueueItem | undefined;
+        if (!cur) return; // item already removed
+        s.put({ ...cur, ...patch });
+      };
+      t.oncomplete = () => resolve();
+      t.onerror = () => reject(t.error);
+    });
   }
 
   async remove(id: string) { await tx(await this.dbp, 'readwrite', (s) => s.delete(id)); }
@@ -566,12 +599,13 @@ Browser-only (canvas + WASM). No bun unit test (needs DOM/canvas); verified in-b
 
 ```ts
 import { encode as encodeAvif } from '@jsquash/avif';
+import { base } from '$app/paths';
 import { quietestCorner } from './quiet-corner';
 import { config } from './config';
-import type { Pixels } from './types';
+import type { Pixels, Processed } from './types';
 
 async function loadLogo(): Promise<ImageBitmap> {
-  const res = await fetch(config.logoPath);
+  const res = await fetch(`${base}/${config.logoFile}`);
   return createImageBitmap(await res.blob());
 }
 
@@ -580,8 +614,6 @@ function cornerXY(corner: string, W: number, H: number, lw: number, lh: number, 
   const y = corner === 'tl' || corner === 'tr' ? pad : H - lh - pad;
   return { x, y };
 }
-
-export interface Processed { avif: Blob; width: number; height: number; bytes: number; }
 
 export async function processImage(file: Blob): Promise<Processed> {
   const src = await createImageBitmap(file);
@@ -687,7 +719,7 @@ Expected: FAIL — `makeR2Uploader` not defined.
 
 ```ts
 import type { Uploader } from './upload-queue';
-import type { QueueItem, Processed, PhotoMeta } from './types';
+import type { QueueItem, Processed, PhotoMeta, SignResult } from './types';
 import { processImage } from './processor';
 
 export interface R2UploaderDeps {
@@ -704,16 +736,20 @@ export function makeR2Uploader(deps: R2UploaderDeps): Uploader {
 
   return {
     async run(item: QueueItem) {
-      const out = await proc(item.file);
-
+      // 1) Sign FIRST: validates passcode before expensive AVIF work, and the
+      //    Worker records a pending row keyed by id (server owns key/public_url).
       const signRes = await f(`${deps.workerUrl}/sign`, {
         method: 'POST',
         headers: { ...auth, 'content-type': 'application/json' },
-        body: JSON.stringify({ id: item.id, eventDate: item.eventDate })
+        body: JSON.stringify({ id: item.id, eventDate: item.eventDate, originalName: item.originalName })
       });
       if (!signRes.ok) throw new Error(`sign failed ${signRes.status}`);
-      const { uploadUrl, publicUrl, key } = await signRes.json();
+      const { uploadUrl } = (await signRes.json()) as SignResult;
 
+      // 2) Process (logo + filter + AVIF).
+      const out = await proc(item.file);
+
+      // 3) PUT to R2. content-type MUST match what was signed exactly.
       const put = await f(uploadUrl, {
         method: 'PUT',
         headers: { 'content-type': 'image/avif' },
@@ -721,9 +757,11 @@ export function makeR2Uploader(deps: R2UploaderDeps): Uploader {
       });
       if (!put.ok) throw new Error(`put failed ${put.status}`);
 
+      // 4) Confirm metadata. Server already knows key/public_url from /sign;
+      //    we only confirm + report dimensions. Idempotent on id.
       const meta: PhotoMeta = {
-        id: item.id, r2_key: key, public_url: publicUrl, event_date: item.eventDate,
-        original_name: item.originalName, width: out.width, height: out.height, bytes: out.bytes
+        id: item.id, original_name: item.originalName,
+        width: out.width, height: out.height, bytes: out.bytes
       };
       const metaRes = await f(`${deps.workerUrl}/meta`, {
         method: 'POST',
@@ -774,9 +812,11 @@ CREATE TABLE IF NOT EXISTS photos (
   width         INTEGER,
   height        INTEGER,
   bytes         INTEGER,
+  status        TEXT NOT NULL DEFAULT 'pending',  -- pending → confirmed (set by /meta)
   created_at    TEXT NOT NULL DEFAULT (datetime('now'))
 );
 CREATE INDEX IF NOT EXISTS idx_photos_event_date ON photos(event_date);
+CREATE INDEX IF NOT EXISTS idx_photos_status ON photos(status);
 ```
 
 - [ ] **Step 3: `wrangler.toml`**
@@ -796,7 +836,8 @@ migrations_dir = "worker/migrations"
 #   PASSCODE, R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY
 [vars]
 R2_BUCKET = "eventlens"
-PUBLIC_BASE = "https://REPLACE.r2.dev"  # public bucket / custom domain
+PUBLIC_BASE = "https://REPLACE.r2.dev"            # public bucket / custom domain
+ALLOWED_ORIGIN = "https://REPLACE.github.io"      # exact deployed app origin
 ```
 
 - [ ] **Step 4: `worker/src/index.ts`**
@@ -812,28 +853,42 @@ interface Env {
   R2_SECRET_ACCESS_KEY: string;
   R2_BUCKET: string;
   PUBLIC_BASE: string;
+  ALLOWED_ORIGIN: string; // exact deployed app origin, e.g. https://user.github.io
 }
 
-const CORS = {
-  'access-control-allow-origin': '*',
-  'access-control-allow-methods': 'POST, OPTIONS',
-  'access-control-allow-headers': 'content-type, x-passcode'
-};
+function cors(env: Env) {
+  return {
+    'access-control-allow-origin': env.ALLOWED_ORIGIN,
+    'access-control-allow-methods': 'POST, OPTIONS',
+    'access-control-allow-headers': 'content-type, x-passcode',
+    'vary': 'origin'
+  };
+}
 
-const json = (o: unknown, status = 200) =>
-  new Response(JSON.stringify(o), { status, headers: { 'content-type': 'application/json', ...CORS } });
+const json = (o: unknown, env: Env, status = 200) =>
+  new Response(JSON.stringify(o), { status, headers: { 'content-type': 'application/json', ...cors(env) } });
 
 export default {
   async fetch(req: Request, env: Env): Promise<Response> {
-    if (req.method === 'OPTIONS') return new Response(null, { headers: CORS });
-    if (req.headers.get('x-passcode') !== env.PASSCODE) return json({ error: 'unauthorized' }, 401);
+    if (req.method === 'OPTIONS') return new Response(null, { headers: cors(env) });
+    if (req.headers.get('x-passcode') !== env.PASSCODE) return json({ error: 'unauthorized' }, env, 401);
 
     const url = new URL(req.url);
 
+    // /sign — validate, record a pending row (server owns key+public_url), return signed PUT URL.
     if (url.pathname === '/sign' && req.method === 'POST') {
-      const { id, eventDate } = await req.json<{ id: string; eventDate: string }>();
-      if (!/^[\w-]{8,}$/.test(id) || !/^\d{4}-\d{2}-\d{2}$/.test(eventDate)) return json({ error: 'bad input' }, 400);
+      const { id, eventDate, originalName } = await req.json<{ id: string; eventDate: string; originalName?: string }>();
+      if (!/^[\w-]{8,}$/.test(id) || !/^\d{4}-\d{2}-\d{2}$/.test(eventDate)) return json({ error: 'bad input' }, env, 400);
+
       const key = `events/${eventDate}/${id}.avif`;
+      const publicUrl = `${env.PUBLIC_BASE}/${key}`;
+
+      // Reserve the row up front. INSERT OR IGNORE so a retried /sign is idempotent.
+      await env.DB.prepare(
+        `INSERT OR IGNORE INTO photos (id, r2_key, public_url, event_date, original_name, status)
+         VALUES (?,?,?,?,?,'pending')`
+      ).bind(id, key, publicUrl, eventDate, originalName ?? null).run();
+
       const target = `https://${env.R2_ACCOUNT_ID}.r2.cloudflarestorage.com/${env.R2_BUCKET}/${key}`;
       const client = new AwsClient({
         accessKeyId: env.R2_ACCESS_KEY_ID,
@@ -845,20 +900,22 @@ export default {
         new Request(`${target}?X-Amz-Expires=3600`, { method: 'PUT', headers: { 'content-type': 'image/avif' } }),
         { aws: { signQuery: true } }
       );
-      return json({ uploadUrl: signed.url, publicUrl: `${env.PUBLIC_BASE}/${key}`, key });
+      return json({ uploadUrl: signed.url, publicUrl, key }, env);
     }
 
+    // /meta — confirm an existing pending row; client cannot inject key/url/date.
     if (url.pathname === '/meta' && req.method === 'POST') {
-      const m = await req.json<any>();
-      await env.DB.prepare(
-        `INSERT OR REPLACE INTO photos
-         (id, r2_key, public_url, event_date, original_name, width, height, bytes)
-         VALUES (?,?,?,?,?,?,?,?)`
-      ).bind(m.id, m.r2_key, m.public_url, m.event_date, m.original_name, m.width, m.height, m.bytes).run();
-      return json({ ok: true });
+      const m = await req.json<{ id: string; original_name?: string; width: number; height: number; bytes: number }>();
+      if (!/^[\w-]{8,}$/.test(m.id)) return json({ error: 'bad input' }, env, 400);
+      const res = await env.DB.prepare(
+        `UPDATE photos SET width=?, height=?, bytes=?, original_name=COALESCE(?, original_name), status='confirmed'
+         WHERE id=?`
+      ).bind(m.width, m.height, m.bytes, m.original_name ?? null, m.id).run();
+      if ((res.meta.changes ?? 0) === 0) return json({ error: 'unknown id' }, env, 404);
+      return json({ ok: true }, env);
     }
 
-    return json({ error: 'not found' }, 404);
+    return json({ error: 'not found' }, env, 404);
   }
 };
 ```
@@ -904,7 +961,11 @@ git add worker wrangler.toml && git commit -m "feat: Cloudflare Worker (sign/met
   let queue: UploadQueue;
   let store: IdbStore;
 
-  function today(): string { return new Date().toISOString().slice(0, 10); }
+  // Local YYYY-MM-DD (avoids UTC off-by-one for late-night Athens uploads).
+  function today(): string {
+    const d = new Date();
+    return new Date(d.getTime() - d.getTimezoneOffset() * 60000).toISOString().slice(0, 10);
+  }
 
   async function refresh() { items = await store.all(); }
 
@@ -1015,8 +1076,9 @@ bunx wrangler deploy
 - [ ] **Step 3: Configure R2 bucket CORS** (allow browser PUT)
 
 ```json
-[{ "AllowedOrigins": ["*"], "AllowedMethods": ["PUT"], "AllowedHeaders": ["content-type"] }]
+[{ "AllowedOrigins": ["https://REPLACE.github.io"], "AllowedMethods": ["PUT"], "AllowedHeaders": ["content-type"], "MaxAgeSeconds": 3600 }]
 ```
+Use the exact deployed app origin (same as the Worker `ALLOWED_ORIGIN`), not `*`.
 
 - [ ] **Step 4: Commit**
 
@@ -1030,6 +1092,13 @@ git add .github && git commit -m "ci: GitHub Pages deploy workflow"
 
 - **Spec coverage:** logo+filter+AVIF → Task 5; quiet corner → Task 2; resilient queue (retry/backoff/idempotent UUID/offline resume) → Tasks 3,4,8; passcode auth → Tasks 6,7; R2 storage → Tasks 6,7,9; D1 metadata + migration → Task 7; static hosting → Tasks 0,9. All covered.
 - **Type consistency:** `QueueStore`/`Uploader` interfaces defined in Task 3, implemented in Tasks 4/6; `Processed`/`PhotoMeta`/`QueueItem` from Task 1 used consistently; `uploader.run()` name matches across queue, tests, and r2-client.
-- **Idempotency:** UUID assigned at enqueue (Task 8); Worker `/meta` uses `INSERT OR REPLACE` so a retry after a mid-flight failure does not duplicate.
-- **Known limitation:** processor has no bun unit test (canvas/WASM are browser-only); covered by manual browser smoke in Task 8 Step 3. Noted, not hidden.
+- **Idempotency:** UUID assigned at enqueue (Task 8); `/sign` uses `INSERT OR IGNORE` (retried sign is a no-op); `/meta` is an idempotent `UPDATE` by id. No duplicates on retry.
+- **Security (post-Codex):** server owns `r2_key`/`public_url` (client can't inject them); `/sign` reserves a pending row and `/meta` only confirms existing ids; CORS locked to `ALLOWED_ORIGIN`; auth checked before AVIF work (sign-first).
+- **Concurrency (post-Codex):** `IdbStore.update` is a single read-modify-write transaction; queue selects only runnable statuses (`pending`/stale `uploading`), never auto-retries `error`; cross-tab double-upload prevented via Web Locks; enqueue-mid-drain closed via `dirty` flag.
+
+### Accepted limitations (deferred, noted not hidden)
+- **Orphan reconciliation:** if R2 PUT succeeds but `/meta` never confirms, the row stays `status='pending'`. The queue retries (idempotent), so this self-heals while the item is queued; a periodic "pending older than N" sweep is deferred to a later sub-project.
+- **Rate-limiting `/sign`:** not in MVP. A leaked passcode could mint URLs for 1h. Deferred; mitigated by locked CORS + short expiry. Revisit if abuse appears.
+- **`processor` unit test:** canvas/WASM are browser-only; covered by manual browser smoke (Task 8 Step 3).
+- **IndexedDB quota:** `IdbStore.add` should surface `QuotaExceededError` to the UI ("δεν χωράει — ανέβασε ό,τι υπάρχει πρώτα"); wire this when implementing Task 8.
 ```
