@@ -1,0 +1,16 @@
+name = "eventlens-worker"
+main = "worker/src/index.ts"
+compatibility_date = "2026-01-01"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "eventlens"
+database_id = "REPLACE_AFTER_CREATE"
+migrations_dir = "worker/migrations"
+
+# Secrets (set via `wrangler secret put`):
+#   PASSCODE, R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY
+[vars]
+R2_BUCKET = "eventlens"
+PUBLIC_BASE = "https://REPLACE.r2.dev"            # public bucket / custom domain
+ALLOWED_ORIGIN = "https://REPLACE.github.io"      # exact deployed app origin
