@@ -81,6 +81,23 @@ export default {
       return json({ ok: true }, env);
     }
 
+    // /wall — public (no passcode): confirmed photos for one event date, minimal fields,
+    // for the public projection screen. Images are already public, so no auth is required.
+    if (url.pathname === '/wall' && req.method === 'GET') {
+      const date = url.searchParams.get('date') ?? '';
+      // Round-trip validation rejects shapes AND non-real dates (e.g. 2026-02-31 -> would
+      // normalize to March under a bare Date.parse).
+      const parsed = new Date(`${date}T00:00:00.000Z`);
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(date) || parsed.toISOString().slice(0, 10) !== date) {
+        return json({ error: 'bad input' }, env, 400);
+      }
+      const { results } = await env.DB.prepare(
+        `SELECT id, public_url, created_at
+         FROM photos WHERE event_date = ? AND status = 'confirmed' ORDER BY created_at`
+      ).bind(date).all();
+      return json({ photos: results ?? [] }, env);
+    }
+
     // /list — manager only. Confirmed photos for one event date.
     if (url.pathname === '/list' && req.method === 'GET') {
       if (!isManager) return json({ error: 'unauthorized' }, env, 401);

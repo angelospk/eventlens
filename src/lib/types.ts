@@ -54,3 +54,29 @@ export interface PhotoListItem {
   bytes: number;
   created_at: string;
 }
+
+// --- Photo Wall (sub-project 4) ---
+
+// One confirmed photo as returned by the public GET /wall endpoint (minimal shape).
+export interface WallPhoto {
+  id: string;
+  public_url: string;
+  created_at: string;
+}
+
+// A sponsor slot, defined in static/sponsors.json.
+export interface Sponsor {
+  type: 'message' | 'image';
+  text?: string;        // for type 'message'
+  imageUrl?: string;    // for type 'image'
+  durationMs?: number;  // falls back to opts.defaultSponsorMs if absent
+}
+
+// A single entry the wall player renders. buildPlaylist() produces Slide[].
+export interface Slide {
+  kind: 'photo' | 'message' | 'image';
+  src?: string;         // photo/image URL
+  text?: string;        // message text
+  durationMs: number;
+  key: string;          // stable key for {#each}
+}

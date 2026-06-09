@@ -1,0 +1,5 @@
+[
+  { "type": "message", "text": "Καλώς ήρθατε στη βραδιά μας ✨", "durationMs": 5000 },
+  { "type": "message", "text": "Φωτογραφίες από τη σημερινή γιορτή — ανεβάστε κι εσείς τις δικές σας!" },
+  { "type": "image", "imageUrl": "/logo.png", "durationMs": 4000 }
+]
