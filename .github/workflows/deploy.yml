@@ -5,15 +5,15 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: oven-sh/setup-bun@v2
       - run: bun install
       - run: BASE_PATH="/${GITHUB_REPOSITORY#*/}" VITE_WORKER_URL="${{ vars.VITE_WORKER_URL }}" bun run build
-      - uses: actions/upload-pages-artifact@v3
+      - uses: actions/upload-pages-artifact@v5
         with: { path: build }
   deploy:
     needs: build
     runs-on: ubuntu-latest
     environment: { name: github-pages }
     steps:
-      - uses: actions/deploy-pages@v4
+      - uses: actions/deploy-pages@v5
