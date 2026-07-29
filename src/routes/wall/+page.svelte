@@ -3,36 +3,37 @@
   import { browser } from '$app/environment';
   import { base } from '$app/paths';
   import { config } from '$lib/config';
-  import { fetchWallPhotos, loadSponsors } from '$lib/wall-client';
+  import { fetchWall, loadSponsors } from '$lib/wall-client';
   import { buildPlaylist } from '$lib/playlist';
+  import { today, isValidDate } from '$lib/date';
   import type { Sponsor, Slide } from '$lib/types';
 
   // Playback tuning (ms). Sponsors interleave after every `sponsorEvery` photos.
   const OPTS = { photoDurationMs: 6000, sponsorEvery: 4, defaultSponsorMs: 5000 };
   const POLL_MS = 30000;
 
-  // Local YYYY-MM-DD (avoids UTC off-by-one), matching the manager page.
-  function today(): string {
-    const d = new Date();
-    return new Date(d.getTime() - d.getTimezoneOffset() * 60000).toISOString().slice(0, 10);
-  }
-
   let slides = $state<Slide[]>([]);
   let index = $state(0);
   let sponsors: Sponsor[] = [];
   let date = today();
+  let pinnedDate = false; // true when ?date= was given, so the rollover check stays off
+  let controlsVisible = $state(true);
+  let isFullscreen = $state(false);
 
   // Keys of images that failed to load; skipped during advance so a broken URL never sticks.
   const failed = new Set<string>();
 
   let advanceTimer: ReturnType<typeof setTimeout> | null = null;
   let pollTimer: ReturnType<typeof setInterval> | null = null;
+  let idleTimer: ReturnType<typeof setTimeout> | null = null;
   let inflight: AbortController | null = null;
 
   let current = $derived(slides[index]);
+  // Warm the browser cache for whatever comes next so the swap is instant on the projector.
+  let nextSrc = $derived(slides.length > 1 ? slides[(index + 1) % slides.length]?.src : undefined);
 
-  // sponsors.json image URLs may be: a full URL (http(s):// or protocol-relative //) — used as-is;
-  // or a root-absolute path ("/logo.png") — rewritten under the SvelteKit base path so it resolves
+  // sponsors.json image URLs may be: a full URL (http(s):// or protocol-relative //) - used as-is;
+  // or a root-absolute path ("/logo.png") - rewritten under the SvelteKit base path so it resolves
   // on subpath deployments (e.g. GitHub Pages). Relative paths are left untouched.
   function normalizeSponsorUrls(list: Sponsor[]): Sponsor[] {
     return list.map((s) => {
@@ -83,14 +84,25 @@
   }
 
   async function refresh() {
+    // A wall left running overnight should follow the calendar, otherwise it keeps showing
+    // yesterday's event after midnight. An explicit ?date= stays pinned.
+    if (!pinnedDate) {
+      const now = today();
+      if (now !== date) {
+        date = now;
+        failed.clear();
+      }
+    }
+
     inflight?.abort();
     inflight = new AbortController();
+    const signal = inflight.signal;
     try {
-      const photos = await fetchWallPhotos(
-        { workerUrl: config.workerUrl, fetchImpl: (u, o) => fetch(u, { ...o, signal: inflight!.signal }) },
+      const res = await fetchWall(
+        { workerUrl: config.workerUrl, fetchImpl: (u, o) => fetch(u, { ...o, signal }) },
         date
       );
-      applyPlaylist(buildPlaylist(photos, sponsors, OPTS));
+      applyPlaylist(buildPlaylist(res.photos, sponsors, OPTS));
     } catch {
       // Network/abort error: keep the current playlist, try again next interval.
     }
@@ -102,35 +114,81 @@
     if (slides[index]?.key === key) next();
   }
 
-  onMount(async () => {
+  async function toggleFullscreen() {
+    try {
+      if (document.fullscreenElement) await document.exitFullscreen();
+      else await document.documentElement.requestFullscreen();
+    } catch {
+      // Some browsers refuse without a direct gesture; nothing useful to show the operator.
+    }
+  }
+
+  function wake() {
+    controlsVisible = true;
+    if (idleTimer !== null) clearTimeout(idleTimer);
+    idleTimer = setTimeout(() => (controlsVisible = false), 3000);
+  }
+
+  const onFs = () => (isFullscreen = Boolean(document.fullscreenElement));
+
+  // Deliberately not an async callback: Svelte ignores the cleanup function returned by an
+  // async onMount, which would leak the fullscreen listener on every navigation.
+  onMount(() => {
     if (!browser) return;
     const qd = new URLSearchParams(window.location.search).get('date');
-    if (qd && /^\d{4}-\d{2}-\d{2}$/.test(qd)) date = qd;
-    sponsors = normalizeSponsorUrls(await loadSponsors(`${base}/sponsors.json`));
-    await refresh();
-    pollTimer = setInterval(refresh, POLL_MS);
+    if (qd && isValidDate(qd)) { date = qd; pinnedDate = true; }
+    document.addEventListener('fullscreenchange', onFs);
+    wake();
+
+    void (async () => {
+      // Nothing before the timer is allowed to prevent it from being set. This screen runs
+      // unattended on a projector all night; a stall here is a black screen nobody fixes.
+      try {
+        sponsors = normalizeSponsorUrls(await loadSponsors(`${base}/sponsors.json`));
+      } catch {
+        sponsors = [];
+      }
+      try {
+        await refresh();
+      } finally {
+        pollTimer = setInterval(refresh, POLL_MS);
+      }
+    })();
   });
 
   onDestroy(() => {
     clearAdvance();
     if (pollTimer !== null) clearInterval(pollTimer);
+    if (idleTimer !== null) clearTimeout(idleTimer);
     inflight?.abort();
+    if (browser) document.removeEventListener('fullscreenchange', onFs);
   });
 </script>
 
 <svelte:head>
-  <title>EventLens — Wall</title>
+  <title>EventLens - Wall</title>
   <meta name="robots" content="noindex" />
+  {#if nextSrc}
+    <link rel="preload" as="image" href={nextSrc} />
+  {/if}
 </svelte:head>
 
-<div class="wall">
+<div class="wall" role="presentation" onmousemove={wake} ontouchstart={wake}>
   {#if !current}
-    <p class="placeholder">Σε λίγο…</p>
+    <p class="placeholder">Σε λίγο</p>
   {:else if current.kind === 'photo' || current.kind === 'image'}
-    <img class="full" src={current.src} alt="" onerror={() => onImgError(current.key)} />
+    {#key current.key}
+      <img class="full" src={current.src} alt="" onerror={() => onImgError(current.key)} />
+    {/key}
   {:else}
-    <p class="message">{current.text}</p>
+    {#key current.key}
+      <p class="message">{current.text}</p>
+    {/key}
   {/if}
+
+  <button class="fs" class:hidden={!controlsVisible} onclick={toggleFullscreen}>
+    {isFullscreen ? 'Έξοδος από πλήρη οθόνη' : 'Πλήρης οθόνη'}
+  </button>
 </div>
 
 <style>
@@ -150,6 +208,12 @@
     max-width: 100%;
     max-height: 100%;
     object-fit: contain;
+    animation: fade 0.6s ease;
+  }
+
+  @keyframes fade {
+    from { opacity: 0; }
+    to { opacity: 1; }
   }
 
   .placeholder,
@@ -158,6 +222,7 @@
     text-align: center;
     padding: 5vw;
     font-family: system-ui, sans-serif;
+    animation: fade 0.6s ease;
   }
 
   .placeholder { opacity: 0.5; font-size: 4vw; }
@@ -167,5 +232,33 @@
     font-weight: 600;
     line-height: 1.3;
     max-width: 80vw;
+  }
+
+  .fs {
+    position: absolute;
+    bottom: 2vmin;
+    right: 2vmin;
+    font: inherit;
+    font-size: 0.85rem;
+    color: #fff;
+    background: rgb(255 255 255 / 0.12);
+    border: 1px solid rgb(255 255 255 / 0.2);
+    border-radius: 999px;
+    padding: 0.5rem 1rem;
+    cursor: pointer;
+    transition: opacity 0.4s ease;
+  }
+
+  .fs.hidden {
+    opacity: 0;
+    pointer-events: none;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .full,
+    .placeholder,
+    .message {
+      animation: none;
+    }
   }
 </style>

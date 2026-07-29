@@ -1,0 +1,299 @@
+/* Design tokens. The app is dark-locked on purpose: it is used in dim venues, on a
+   projector, and on phones at night. A light mode would be actively hostile here. */
+
+:root {
+  color-scheme: dark;
+
+  --bg: #0b0d12;
+  --surface: #12151d;
+  --surface-2: #181c26;
+  --line: #262b38;
+  --line-strong: #38405233;
+
+  --text: #f3f4f6;
+  --text-dim: #9aa3b2;
+  --text-faint: #6b7280;
+
+  --accent: #6366f1;
+  --accent-strong: #4f52e0; /* the accent, darkened until white text clears WCAG AA */
+  --accent-soft: #6366f11f;
+  --accent-text: #c7c9ff;
+
+  --ok: #34d399;
+  --ok-soft: #34d3991f;
+  --warn: #fbbf24;
+  --warn-soft: #fbbf241f;
+  --danger: #f87171;
+  --danger-soft: #f871711f;
+
+  /* One radius scale for the whole app: pill for anything you press,
+     12px for anything that contains content, 8px for inputs. */
+  --r-pill: 999px;
+  --r-card: 12px;
+  --r-input: 8px;
+
+  --pad: clamp(1rem, 4vw, 2rem);
+  --shadow: 0 10px 30px rgb(0 0 0 / 0.45);
+
+  --font: 'Geist', ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto,
+    'Helvetica Neue', sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font);
+  -webkit-font-smoothing: antialiased;
+  /* Keep content clear of the notch and the home indicator when installed. */
+  padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom)
+    env(safe-area-inset-left);
+}
+
+body {
+  min-height: 100dvh;
+}
+
+h1,
+h2,
+h3 {
+  margin: 0;
+  letter-spacing: -0.02em;
+  line-height: 1.15;
+}
+
+p {
+  margin: 0;
+}
+
+/* --- shell ------------------------------------------------------------- */
+
+.shell {
+  max-width: 1100px;
+  margin: 0 auto;
+  padding: var(--pad);
+}
+
+.topbar {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+  padding-block: 0.5rem 1.25rem;
+}
+
+.topbar h1 {
+  font-size: 1.05rem;
+  font-weight: 600;
+  margin-right: auto;
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  margin-right: auto;
+}
+
+.brand img {
+  width: 28px;
+  height: 28px;
+  border-radius: var(--r-input);
+}
+
+/* --- controls ---------------------------------------------------------- */
+
+.btn {
+  appearance: none;
+  border: 1px solid var(--line);
+  background: var(--surface-2);
+  color: var(--text);
+  font: inherit;
+  font-weight: 500;
+  padding: 0.6rem 1.1rem;
+  border-radius: var(--r-pill);
+  cursor: pointer;
+  white-space: nowrap;
+  transition:
+    background 0.18s ease,
+    border-color 0.18s ease,
+    transform 0.12s ease;
+}
+
+.btn:hover:not(:disabled) {
+  background: var(--line);
+}
+
+.btn:active:not(:disabled) {
+  transform: translateY(1px);
+}
+
+.btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.btn-primary {
+  /* Deeper than --accent on purpose: the accent itself is 4.46:1 against white text,
+     which just misses AA. This shade measures 5.8:1. */
+  background: var(--accent-strong);
+  border-color: var(--accent-strong);
+  color: #fff;
+}
+
+.btn-primary:hover:not(:disabled) {
+  background: #4346c9;
+}
+
+.btn-danger {
+  color: var(--danger);
+  border-color: #f8717155;
+}
+
+.btn-danger:hover:not(:disabled) {
+  background: var(--danger-soft);
+}
+
+.btn-sm {
+  padding: 0.35rem 0.75rem;
+  font-size: 0.82rem;
+}
+
+:where(button, a, input, select, [tabindex]):focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+label {
+  display: block;
+  font-size: 0.82rem;
+  color: var(--text-dim);
+  margin-bottom: 0.4rem;
+}
+
+input[type='password'],
+input[type='text'],
+input[type='date'] {
+  width: 100%;
+  font: inherit;
+  color: var(--text);
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--r-input);
+  padding: 0.7rem 0.85rem;
+}
+
+input::placeholder {
+  /* var(--text-faint) against --surface is 4.7:1, so the hint stays readable. */
+  color: var(--text-faint);
+}
+
+input:focus {
+  border-color: var(--accent);
+  outline: none;
+}
+
+/* --- surfaces ---------------------------------------------------------- */
+
+.card {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--r-card);
+  padding: 1.1rem;
+}
+
+.login {
+  max-width: 360px;
+  margin: min(18vh, 8rem) auto 0;
+}
+
+.login h1 {
+  font-size: 1.5rem;
+  margin-bottom: 0.4rem;
+}
+
+.login .sub {
+  color: var(--text-dim);
+  font-size: 0.9rem;
+  margin-bottom: 1.4rem;
+}
+
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  font-size: 0.75rem;
+  font-weight: 500;
+  padding: 0.2rem 0.6rem;
+  border-radius: var(--r-pill);
+  border: 1px solid transparent;
+}
+
+.chip-ok {
+  background: var(--ok-soft);
+  color: var(--ok);
+}
+.chip-warn {
+  background: var(--warn-soft);
+  color: var(--warn);
+}
+.chip-danger {
+  background: var(--danger-soft);
+  color: var(--danger);
+}
+.chip-accent {
+  background: var(--accent-soft);
+  color: var(--accent-text);
+}
+.chip-mute {
+  background: var(--surface-2);
+  color: var(--text-dim);
+}
+
+.hint {
+  color: var(--text-dim);
+  font-size: 0.87rem;
+}
+
+.error {
+  color: var(--danger);
+  font-size: 0.87rem;
+}
+
+.empty {
+  text-align: center;
+  padding: 3rem 1rem;
+  color: var(--text-dim);
+}
+
+/* Skeletons mirror the shape of what is loading rather than spinning in place. */
+.skeleton {
+  background: linear-gradient(90deg, var(--surface) 25%, var(--surface-2) 37%, var(--surface) 63%);
+  background-size: 400% 100%;
+  border-radius: var(--r-card);
+  animation: shimmer 1.4s ease infinite;
+}
+
+@keyframes shimmer {
+  from {
+    background-position: 100% 0;
+  }
+  to {
+    background-position: 0 0;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+  }
+}

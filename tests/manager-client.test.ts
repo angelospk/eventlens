@@ -3,13 +3,23 @@ import { fetchList } from '../src/lib/manager-client';
 
 test('GETs /list with date query + manager passcode header, returns photos', async () => {
   let seenUrl = '';
-  let seenHeader: string | null = null;
+  let seenHeader: string | null | undefined;
   const fakeFetch = mock(async (url: string, opts: any) => {
     seenUrl = url;
     seenHeader = opts?.headers?.['x-manager-passcode'] ?? null;
-    return new Response(JSON.stringify({ photos: [{ id: 'a', public_url: 'u', original_name: 'p.jpg', width: 1, height: 2, bytes: 3, created_at: 't' }] }));
+    return new Response(
+      JSON.stringify({
+        photos: [
+          {
+            id: 'a', public_url: 'u', original_name: 'p.jpg',
+            width: 1, height: 2, bytes: 3, created_at: 't', moderation: 'pending'
+          }
+        ],
+        event: { date: '2026-06-08', title: 'Γάμος', autoApprove: false }
+      })
+    );
   });
-  const photos = await fetchList(
+  const { photos, event } = await fetchList(
     { workerUrl: 'https://wkr', passcode: 'm-secret', fetchImpl: fakeFetch as any },
     '2026-06-08'
   );
@@ -17,6 +27,8 @@ test('GETs /list with date query + manager passcode header, returns photos', asy
   expect(seenHeader).toBe('m-secret');
   expect(photos.length).toBe(1);
   expect(photos[0].id).toBe('a');
+  expect(photos[0].moderation).toBe('pending');
+  expect(event.autoApprove).toBe(false);
 });
 
 test('throws on non-200', async () => {

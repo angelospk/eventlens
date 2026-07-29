@@ -1,10 +1,11 @@
 import type { Uploader } from './upload-queue';
-import type { QueueItem, Processed, PhotoMeta, SignResult } from './types';
+import type { QueueItem, Processed, PhotoMeta, SignResult, FetchLike } from './types';
+import { AlreadyUploadedError, classifyStatus } from './errors';
 
 export interface R2UploaderDeps {
   workerUrl: string;
   passcode: string;
-  fetchImpl?: typeof fetch;
+  fetchImpl?: FetchLike;
   process?: (file: Blob) => Promise<Processed>;
 }
 
@@ -17,20 +18,26 @@ export function makeR2Uploader(deps: R2UploaderDeps): Uploader {
 
   return {
     async run(item: QueueItem) {
-      // 1) Sign FIRST: validates passcode before expensive AVIF work, and the
+      // 1) Sign FIRST: validates the passcode before expensive AVIF work, and the
       //    Worker records a pending row keyed by id (server owns key/public_url).
       const signRes = await f(`${deps.workerUrl}/sign`, {
         method: 'POST',
         headers: { ...auth, 'content-type': 'application/json' },
         body: JSON.stringify({ id: item.id, eventDate: item.eventDate, originalName: item.originalName })
       });
-      if (!signRes.ok) throw new Error(`sign failed ${signRes.status}`);
+      if (signRes.status === 409) {
+        // The server already has this photo confirmed, so a previous attempt got through
+        // and only its response was lost. Nothing to redo.
+        throw new AlreadyUploadedError(item.id);
+      }
+      if (!signRes.ok) throw classifyStatus(signRes.status, 'sign') ?? new Error(`sign failed ${signRes.status}`);
       const { uploadUrl } = (await signRes.json()) as SignResult;
 
-      // 2) Process (logo + filter + AVIF).
+      // 2) Process (grade + logo + AVIF) off the main thread.
       const out = await proc(item.file);
 
-      // 3) PUT to R2. content-type MUST match what was signed exactly.
+      // 3) PUT to R2. content-type MUST match what was signed exactly. Every failure here
+      //    is retryable: each attempt re-signs, so even an expired signature self-heals.
       const put = await f(uploadUrl, {
         method: 'PUT',
         headers: { 'content-type': 'image/avif' },
@@ -49,7 +56,10 @@ export function makeR2Uploader(deps: R2UploaderDeps): Uploader {
         headers: { ...auth, 'content-type': 'application/json' },
         body: JSON.stringify(meta)
       });
-      if (!metaRes.ok) throw new Error(`meta failed ${metaRes.status}`);
+      // 404 here means the row is no longer pending — i.e. something already confirmed it.
+      // The bytes are in R2 and the row is confirmed, so this is a success too.
+      if (metaRes.status === 404) throw new AlreadyUploadedError(item.id);
+      if (!metaRes.ok) throw classifyStatus(metaRes.status, 'meta') ?? new Error(`meta failed ${metaRes.status}`);
     }
   };
 }

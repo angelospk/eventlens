@@ -1,5 +1,12 @@
 export type Corner = 'tl' | 'tr' | 'bl' | 'br';
 
+/**
+ * What the clients actually need from fetch. Narrower than `typeof fetch` on purpose: the
+ * real global carries extra members (Bun adds `preconnect`), so an inline arrow function or
+ * a test mock would not satisfy it.
+ */
+export type FetchLike = (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
+
 export interface Pixels {
   data: Uint8ClampedArray; // RGBA
   width: number;
@@ -20,6 +27,10 @@ export interface QueueItem {
   eventDate: string;     // YYYY-MM-DD
   status: ItemStatus;
   attempts: number;
+  // Epoch ms when the photo was picked. IndexedDB returns rows ordered by key, and the key
+  // is a uuid, so without this the queue uploads in effectively random order and the wall
+  // shows the night out of sequence.
+  queuedAt?: number;
   lastError?: string;
   nextAttemptAt?: number; // epoch ms; item is not retried before this (backoff without blocking the queue)
   // populated after processing:
@@ -44,6 +55,10 @@ export interface PhotoMeta {
 // Returned by /sign.
 export interface SignResult { uploadUrl: string; publicUrl: string; key: string; }
 
+// Where a confirmed photo stands with the manager. Separate from upload `status`: a photo
+// can be fully uploaded and still not be public.
+export type Moderation = 'pending' | 'approved' | 'hidden';
+
 // Returned by GET /list — one confirmed photo's metadata for the manager grid.
 export interface PhotoListItem {
   id: string;
@@ -53,6 +68,15 @@ export interface PhotoListItem {
   height: number;
   bytes: number;
   created_at: string;
+  moderation: Moderation;
+}
+
+// One night's settings. `autoApprove` is the per-event switch: on = photos go public the
+// moment they land, off = the manager approves each one.
+export interface EventSettings {
+  date: string;
+  title: string | null;
+  autoApprove: boolean;
 }
 
 // --- Photo Wall (sub-project 4) ---

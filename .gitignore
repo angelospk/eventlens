@@ -18,6 +18,11 @@ Thumbs.db
 !.env.example
 !.env.test
 
+# Local worker secrets for `wrangler dev` (PASSCODE, MANAGER_PASSCODE, R2 keys)
+.dev.vars
+.dev.vars.*
+!.dev.vars.example
+
 # Vite
 vite.config.js.timestamp-*
 vite.config.ts.timestamp-*

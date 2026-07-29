@@ -8,10 +8,19 @@ database_name = "eventlens"
 database_id = "f25bd292-10d6-47c7-958a-9572af46e723"
 migrations_dir = "worker/migrations"
 
+# Needed to delete objects when the manager deletes a photo.
+[[r2_buckets]]
+binding = "BUCKET"
+bucket_name = "eventlens"
+
 # Secrets (set via `wrangler secret put`):
-#   PASSCODE, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY
+#   PASSCODE, MANAGER_PASSCODE, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY
 [vars]
 R2_BUCKET = "eventlens"
 R2_ACCOUNT_ID = "aec2a7c0bf16c5229ab4790e5bf3100f"
-PUBLIC_BASE = "https://pub-8cc0fc35edf94016a199f64267c2bb34.r2.dev"  # public bucket dev URL
+# Where guests load the photos from. r2.dev is rate-limited and dev-only, so a busy
+# public page needs a custom domain on the bucket. Photo URLs are derived from this at
+# read time, so flipping it fixes up past photos too.
+PUBLIC_BASE = "https://pub-8cc0fc35edf94016a199f64267c2bb34.r2.dev"
+# PUBLIC_BASE = "https://photos.haroldpoi.dev"   # ← switch to this once the R2 custom domain is live
 ALLOWED_ORIGIN = "https://angelospk.github.io"    # exact deployed app origin (GitHub Pages)

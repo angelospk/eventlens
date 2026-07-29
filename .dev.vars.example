@@ -1,0 +1,7 @@
+# Copy to `.dev.vars` (gitignored) and fill in for `wrangler dev`.
+# In production these are set with `wrangler secret put <NAME>` and Cloudflare never
+# gives their values back — if you lose one, you set a new one, you don't recover it.
+PASSCODE="choose-a-photographer-passcode"
+MANAGER_PASSCODE="choose-a-different-manager-passcode"
+R2_ACCESS_KEY_ID=""
+R2_SECRET_ACCESS_KEY=""

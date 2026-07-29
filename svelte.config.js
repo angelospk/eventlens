@@ -9,9 +9,9 @@ const config = {
 	kit: {
 		adapter: adapter({ fallback: 'index.html' }),
 		paths: { base },
-		// '/manager' and '/wall' are not linked from the root, so they must be listed
-		// explicitly, otherwise GitHub Pages 404s a direct hit (no prerendered file).
-		prerender: { entries: ['*', '/manager', '/wall'] }
+		// '/manager', '/wall' and '/live' are not linked from the root, so they must be
+		// listed explicitly, otherwise GitHub Pages 404s a direct hit (no prerendered file).
+		prerender: { entries: ['*', '/manager', '/wall', '/live'] }
 	}
 };
 
