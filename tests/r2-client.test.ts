@@ -20,7 +20,7 @@ test('signs first, PUTs blob, then POSTs /meta in order', async () => {
 
   const uploader = makeR2Uploader({
     workerUrl: 'https://wkr',
-    passcode: 'secret',
+    auth: async () => ({ authorization: 'Bearer tok' }),
     fetchImpl: fakeFetch as any,
     process: fakeProcess
   });

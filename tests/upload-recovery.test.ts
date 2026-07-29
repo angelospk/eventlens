@@ -188,7 +188,7 @@ test('uploader turns a 409 from /sign into AlreadyUploaded and skips processing'
   let processed = false;
   const uploader = makeR2Uploader({
     workerUrl: 'https://wkr',
-    passcode: 'p',
+    auth: async () => ({ authorization: 'Bearer tok' }),
     process: async () => {
       processed = true;
       return { avif: new Blob(['a']), width: 1, height: 1, bytes: 1 };
@@ -208,7 +208,7 @@ test('uploader turns a 409 from /sign into AlreadyUploaded and skips processing'
 test('uploader turns a 401 from /sign into a non-retryable error', async () => {
   const uploader = makeR2Uploader({
     workerUrl: 'https://wkr',
-    passcode: 'wrong',
+    auth: async () => ({ authorization: 'Bearer tok' }),
     process: async () => ({ avif: new Blob(['a']), width: 1, height: 1, bytes: 1 }),
     fetchImpl: (async () => new Response('{"error":"unauthorized"}', { status: 401 })) as any
   });

@@ -7,8 +7,7 @@
   import { IdbStore } from '$lib/idb-store';
   import { UploadQueue } from '$lib/upload-queue';
   import { makeR2Uploader } from '$lib/r2-client';
-  import { verifyPasscode } from '$lib/auth-client';
-  import { loadPhotographerPasscode, savePhotographerPasscode, clearPasscodes } from '$lib/session';
+  import { Session } from '$lib/session';
   import type { QueueItem } from '$lib/types';
 
   let passcode = $state('');
@@ -18,8 +17,13 @@
   let items = $state<QueueItem[]>([]);
   let completed = $state(0);
   let online = $state(true);
+  // True when the photographer was let in without the server confirming the passcode.
+  // Signing in offline is deliberate, but it must not look like a verified session: a typo
+  // would otherwise be discovered only when the first upload fails.
+  let unverified = $state(false);
   let queue: UploadQueue;
   let store: IdbStore;
+  const session = new Session(config.workerUrl, 'photographer');
 
   // One object URL per queued file, revoked as soon as the item leaves the queue so a long
   // night of shooting does not leak hundreds of blobs.
@@ -51,11 +55,14 @@
     syncThumbs(list);
     items = list;
     completed = queue?.completed ?? 0;
+    // The first request that gets through exchanges the passcode for a token, which
+    // retroactively confirms an offline sign-in.
+    if (unverified && session.verified) unverified = false;
   }
 
-  function start(code: string) {
+  function start() {
     store = new IdbStore();
-    const uploader = makeR2Uploader({ workerUrl: config.workerUrl, passcode: code });
+    const uploader = makeR2Uploader({ workerUrl: config.workerUrl, auth: () => session.headers() });
     queue = new UploadQueue(store, uploader, config.retry, refresh);
     loggedIn = true;
     refresh();
@@ -66,25 +73,23 @@
     loginError = '';
     checking = true;
     try {
-      const role = await verifyPasscode({ workerUrl: config.workerUrl }, passcode, 'photographer');
-      if (!role) {
-        loginError = 'Λάθος κωδικός.';
+      const result = await session.signIn(passcode);
+      if (result === 'bad') {
+        loginError = 'Λάθος κωδικός, ή πολλές αποτυχημένες προσπάθειες. Δοκίμασε ξανά σε ένα λεπτό.';
         return;
       }
-      savePhotographerPasscode(passcode);
-      start(passcode);
-    } catch {
-      // No network: let the photographer in anyway. Photos queue locally and the passcode
-      // gets checked for real on the first upload once there is signal again.
-      savePhotographerPasscode(passcode);
-      start(passcode);
+      // 'offline' still lets the photographer in: photos queue locally and the passcode is
+      // exchanged for a token on the first request that gets through.
+      unverified = result === 'offline';
+      passcode = '';
+      start();
     } finally {
       checking = false;
     }
   }
 
   function logout() {
-    clearPasscodes();
+    session.signOut();
     loggedIn = false;
     passcode = '';
     // Drop the rendered state with the session, otherwise the next login flashes the
@@ -156,11 +161,8 @@
     window.addEventListener('offline', goOffline);
     document.addEventListener('visibilitychange', onVisible);
 
-    const saved = loadPhotographerPasscode();
-    if (saved) {
-      passcode = saved;
-      start(saved);
-    }
+    // A token from an earlier page load means no passcode prompt at all.
+    if (session.restore()) start();
 
     return () => {
       window.removeEventListener('online', goOnline);
@@ -224,6 +226,16 @@
       </span>
     </label>
     <input id="files" class="visually-hidden" type="file" accept="image/*" multiple onchange={onPick} />
+
+    {#if unverified}
+      <div class="notice">
+        <strong>Ο κωδικός δεν επιβεβαιώθηκε</strong>
+        <span class="hint">
+          Μπήκες χωρίς σύνδεση στον διακομιστή. Οι φωτογραφίες μπαίνουν κανονικά στην ουρά,
+          αλλά αν ο κωδικός είναι λάθος θα αποτύχουν όταν γυρίσει το δίκτυο.
+        </span>
+      </div>
+    {/if}
 
     {#if pickError}
       <p class="error" style="margin-bottom:1rem">{pickError}</p>
@@ -335,6 +347,22 @@
     overflow: hidden;
     clip: rect(0 0 0 0);
     white-space: nowrap;
+  }
+
+  .notice {
+    display: flex;
+    flex-direction: column;
+    gap: 0.25rem;
+    padding: 0.75rem 1rem;
+    margin-bottom: 1rem;
+    background: var(--warn-soft);
+    border: 1px solid #fbbf2433;
+    border-radius: var(--r-card);
+  }
+
+  .notice strong {
+    color: var(--warn);
+    font-size: 0.9rem;
   }
 
   .retry-bar {

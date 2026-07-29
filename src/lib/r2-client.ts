@@ -1,10 +1,11 @@
 import type { Uploader } from './upload-queue';
 import type { QueueItem, Processed, PhotoMeta, SignResult, FetchLike } from './types';
 import { AlreadyUploadedError, classifyStatus } from './errors';
+import type { AuthHeaders } from './session';
 
 export interface R2UploaderDeps {
   workerUrl: string;
-  passcode: string;
+  auth: AuthHeaders;
   fetchImpl?: FetchLike;
   process?: (file: Blob) => Promise<Processed>;
 }
@@ -14,11 +15,14 @@ export function makeR2Uploader(deps: R2UploaderDeps): Uploader {
   // Lazy import keeps the browser-only processor (and its `$app/paths` import)
   // out of non-browser test loads. Tests inject `process`, so this never runs there.
   const proc = deps.process ?? ((file: Blob) => import('./processor').then((m) => m.processImage(file)));
-  const auth = { 'x-passcode': deps.passcode };
 
   return {
     async run(item: QueueItem) {
-      // 1) Sign FIRST: validates the passcode before expensive AVIF work, and the
+      // Resolved per attempt rather than captured once: a retry hours later must not send
+      // a token that expired while the photo sat in the queue.
+      const auth = await deps.auth();
+
+      // 1) Sign FIRST: validates the credentials before expensive AVIF work, and the
       //    Worker records a pending row keyed by id (server owns key/public_url).
       const signRes = await f(`${deps.workerUrl}/sign`, {
         method: 'POST',

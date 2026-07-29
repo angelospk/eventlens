@@ -19,7 +19,8 @@ Worker (`worker/src/index.ts`):
 
 | Endpoint | Auth | Τι κάνει |
 |---|---|---|
-| `GET /auth` | φωτογράφος ή διαχειριστής | Επικύρωση passcode πριν αρχίσει η δουλειά. |
+| `GET /auth` | φωτογράφος ή διαχειριστής | Ανταλλάσσει το passcode με token 16 ωρών. |
+| `GET /img/<key>` | δημόσιο | Σερβίρει τη φωτογραφία από το R2, edge-cached για έναν χρόνο. |
 | `POST /sign` | φωτογράφος | Κρατάει pending γραμμή, γυρίζει signed PUT URL. |
 | `POST /meta` | φωτογράφος | Επιβεβαίωση upload· εφαρμόζει το auto-approve της βραδιάς. |
 | `GET /list` | διαχειριστής | Όλες οι φωτό μιας ημερομηνίας + οι ρυθμίσεις της. |
@@ -37,7 +38,8 @@ Worker (`worker/src/index.ts`):
 | 3 | Moderation (approve / hide / delete) | ✅ Υλοποιημένο |
 | 4 | Photo Wall | ✅ Deployed |
 | 5 | PWA + offline | ✅ Υλοποιημένο |
-| 6 | AI curation (vision scoring, captions) | ⏳ Δεν ξεκίνησε |
+| 6 | Tokens + rate limiting + σερβίρισμα εικόνων | ✅ Υλοποιημένο |
+| 7 | AI curation (vision scoring, captions) | ⏳ Δεν ξεκίνησε |
 
 Specs: `docs/superpowers/specs/`.
 
@@ -87,18 +89,43 @@ bun run build        # static build → build/
 Ο frontend διαβάζει το Worker URL από το `VITE_WORKER_URL` (fallback `http://localhost:8787`).
 Ο service worker είναι ενεργός μόνο στο production build.
 
+Για τοπική δουλειά: `cp .dev.vars.example .dev.vars` και συμπλήρωσέ το. Το `ALLOWED_ORIGIN`
+εκεί πρέπει να δείχνει στο localhost του Vite, αλλιώς ο browser κόβεται από CORS, γιατί η
+τιμή του production είναι το origin του GitHub Pages. Επίσης
+`bunx wrangler d1 migrations apply eventlens --local` για τη βάση.
+
 ## Deploy
 
 - **Worker:** `bunx wrangler deploy`. Πριν το πρώτο deploy της moderation:
   `bunx wrangler d1 migrations apply eventlens --remote`. Secrets μέσω
-  `wrangler secret put` (`PASSCODE`, `MANAGER_PASSCODE`, `R2_ACCESS_KEY_ID`,
-  `R2_SECRET_ACCESS_KEY`). Λεπτομέρειες: `worker/DEPLOY.md`.
+  `wrangler secret put`: `PASSCODE`, `MANAGER_PASSCODE`, `TOKEN_SECRET`
+  (`openssl rand -base64 32`), `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`.
+  Λεπτομέρειες: `worker/DEPLOY.md`.
 - **Frontend:** auto-deploy σε GitHub Pages με push στο `main`
   (`.github/workflows/deploy.yml`).
 
+## Ασφάλεια
+
+- **Το passcode δεν αποθηκεύεται ποτέ στον browser.** Το `/auth` το ανταλλάσσει με ένα
+  υπογεγραμμένο token 16 ωρών και αποθηκεύεται μόνο αυτό. Σημασία έχει επειδή όλα τα
+  project sites μοιράζονται το `*.github.io` origin, άρα το web storage δεν είναι δικό μας
+  μόνο. Το token του φωτογράφου επιβιώνει reload, του διαχειριστή πεθαίνει με την καρτέλα.
+- **Τα tokens υπογράφονται με ξεχωριστό τυχαίο secret** (`TOKEN_SECRET`), όχι με το
+  passcode. Δελεαστικό να παραχθεί το κλειδί από το passcode, αλλά είναι παγίδα: το token
+  είναι `ρόλος.λήξη.υπογραφή` με τα δύο πρώτα γνωστά, οπότε όποιος κλέψει ένα token θα
+  μπορούσε να σπάσει offline ένα passcode που διάλεξε άνθρωπος. Και ακριβώς αυτό το
+  σενάριο προσπαθούμε να καλύψουμε. Ανάκληση πρόσβασης = αλλαγή **και** των δύο.
+- **Οι λάθος προσπάθειες περιορίζονται** σε 10 ανά λεπτό ανά IP. Μετρώνται μόνο οι
+  αποτυχίες, οπότε μια γεμάτη βραδιά δεν αγγίζει ποτέ το όριο. Το όριο είναι ανά
+  τοποθεσία Cloudflare, όχι παγκόσμιο: επιβραδύνει το brute force, δεν το κάνει αδύνατο,
+  άρα διάλεξε passcode που δεν μαντεύεται.
+- Οι συγκρίσεις passcode γίνονται σε σταθερό χρόνο.
+
 ## Γνωστά όρια
 
-- Το R2 σερβίρεται από το `pub-*.r2.dev` dev URL, που η Cloudflare rate-limitάρει και δεν
-  προορίζεται για production. Με πολύ κόσμο στο `/live` θέλει custom domain στο bucket.
-- Δεν υπάρχει rate limiting στο Worker. Το `/wall` είναι δημόσιο και edge-cached, οπότε το
-  κόστος μιας πλημμύρας είναι μικρό, αλλά δεν είναι μηδέν.
+- Μια κρυφή φωτογραφία φεύγει αμέσως από τις δημόσιες σελίδες, αλλά το αρχείο παραμένει
+  προσβάσιμο σε όποιον έχει ήδη το άμεσο URL του (το κλειδί περιέχει uuid, δεν μαντεύεται).
+  Για να εξαφανιστεί εντελώς, θέλει διαγραφή — η οποία καθαρίζει και το edge cache της
+  εικόνας, όχι μόνο το αρχείο.
+- Το `/live` κάνει polling κάθε 20 δευτερόλεπτα. Είναι φθηνό επειδή η απάντηση είναι
+  edge-cached, αλλά δεν είναι push: μια νέα φωτογραφία εμφανίζεται μέσα σε ~20s.

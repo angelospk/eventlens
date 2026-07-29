@@ -1,12 +1,12 @@
 import { test, expect, mock } from 'bun:test';
 import { fetchList } from '../src/lib/manager-client';
 
-test('GETs /list with date query + manager passcode header, returns photos', async () => {
+test('GETs /list with the date query and the auth header, returns photos', async () => {
   let seenUrl = '';
   let seenHeader: string | null | undefined;
   const fakeFetch = mock(async (url: string, opts: any) => {
     seenUrl = url;
-    seenHeader = opts?.headers?.['x-manager-passcode'] ?? null;
+    seenHeader = opts?.headers?.authorization ?? null;
     return new Response(
       JSON.stringify({
         photos: [
@@ -20,11 +20,15 @@ test('GETs /list with date query + manager passcode header, returns photos', asy
     );
   });
   const { photos, event } = await fetchList(
-    { workerUrl: 'https://wkr', passcode: 'm-secret', fetchImpl: fakeFetch as any },
+    {
+      workerUrl: 'https://wkr',
+      auth: async () => ({ authorization: 'Bearer m-token' }),
+      fetchImpl: fakeFetch as any
+    },
     '2026-06-08'
   );
   expect(seenUrl).toBe('https://wkr/list?date=2026-06-08');
-  expect(seenHeader).toBe('m-secret');
+  expect(seenHeader).toBe('Bearer m-token');
   expect(photos.length).toBe(1);
   expect(photos[0].id).toBe('a');
   expect(photos[0].moderation).toBe('pending');
@@ -34,6 +38,9 @@ test('GETs /list with date query + manager passcode header, returns photos', asy
 test('throws on non-200', async () => {
   const fakeFetch = mock(async () => new Response('{"error":"unauthorized"}', { status: 401 }));
   await expect(
-    fetchList({ workerUrl: 'https://wkr', passcode: 'bad', fetchImpl: fakeFetch as any }, '2026-06-08')
+    fetchList(
+      { workerUrl: 'https://wkr', auth: async () => ({}), fetchImpl: fakeFetch as any },
+      '2026-06-08'
+    )
   ).rejects.toThrow();
 });

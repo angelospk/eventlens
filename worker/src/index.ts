@@ -1,10 +1,13 @@
 import { AwsClient } from 'aws4fetch';
+import { issueToken, secretEquals, verifyToken, type Role } from './token';
 
 interface Env {
   DB: D1Database;
   BUCKET: R2Bucket;
+  AUTH_LIMITER?: RateLimit; // optional so `wrangler dev` still runs without the binding
   PASSCODE: string;
   MANAGER_PASSCODE: string;
+  TOKEN_SECRET: string; // random, independent of the passcodes; see worker/src/token.ts
   R2_ACCOUNT_ID: string;
   R2_ACCESS_KEY_ID: string;
   R2_SECRET_ACCESS_KEY: string;
@@ -25,9 +28,39 @@ function cors(env: Env) {
   return {
     'access-control-allow-origin': env.ALLOWED_ORIGIN,
     'access-control-allow-methods': 'GET, POST, OPTIONS',
-    'access-control-allow-headers': 'content-type, x-passcode, x-manager-passcode',
+    'access-control-allow-headers': 'content-type, authorization, x-passcode, x-manager-passcode',
     vary: 'origin'
   };
+}
+
+/**
+ * Who is calling. A bearer token is the normal path; the raw passcode headers stay
+ * supported because the photographer may sign in with no signal at all, in which case
+ * there was no chance to mint a token yet.
+ *
+ * `failed` distinguishes "presented credentials that were wrong" from "presented none",
+ * so the rate limiter only ever counts real attempts.
+ */
+async function resolveAuth(req: Request, env: Env): Promise<{ role: Role | null; failed: boolean }> {
+  const bearer = req.headers.get('authorization')?.match(/^Bearer (.+)$/)?.[1];
+  if (bearer) {
+    const role = await verifyToken(bearer, env.TOKEN_SECRET, Math.floor(Date.now() / 1000));
+    return { role, failed: role === null };
+  }
+
+  const managerPass = req.headers.get('x-manager-passcode');
+  if (managerPass !== null) {
+    const ok = await secretEquals(managerPass, env.MANAGER_PASSCODE);
+    return { role: ok ? 'manager' : null, failed: !ok };
+  }
+
+  const pass = req.headers.get('x-passcode');
+  if (pass !== null) {
+    const ok = await secretEquals(pass, env.PASSCODE);
+    return { role: ok ? 'photographer' : null, failed: !ok };
+  }
+
+  return { role: null, failed: false };
 }
 
 const json = (o: unknown, env: Env, status = 200, cache = 'no-store') =>
@@ -65,8 +98,19 @@ export default {
     if (req.method === 'OPTIONS') return new Response(null, { headers: cors(env) });
 
     const url = new URL(req.url);
-    const isPhotographer = req.headers.get('x-passcode') === env.PASSCODE;
-    const isManager = req.headers.get('x-manager-passcode') === env.MANAGER_PASSCODE;
+
+    const auth = await resolveAuth(req, env);
+    if (auth.failed) {
+      // Counted only on a wrong credential, so a room full of guests and a busy
+      // photographer never consume the budget that is there to slow down guessing.
+      const ip = req.headers.get('cf-connecting-ip') ?? 'unknown';
+      const { success } = (await env.AUTH_LIMITER?.limit({ key: `auth:${ip}` })) ?? { success: true };
+      if (!success) {
+        return json({ error: 'too_many_attempts' }, env, 429);
+      }
+    }
+    const isPhotographer = auth.role === 'photographer';
+    const isManager = auth.role === 'manager';
 
     // The cached /wall payload for one night. Normalised so ?date=X&anything-else cannot
     // fragment the cache, and shared by the read path and every write that invalidates it.
@@ -79,12 +123,31 @@ export default {
      */
     const purgeWall = (date: string) => ctx.waitUntil(caches.default.delete(wallKey(date)));
 
+    /**
+     * Drops the cached image bytes for one object. Images are cached for a year as
+     * immutable, which is right while the photo exists and very wrong the moment it is
+     * deleted: without this a "permanently deleted" photo keeps being served from the
+     * edge long after it is gone from both R2 and the database.
+     */
+    const purgeImage = (key: string) =>
+      ctx.waitUntil(caches.default.delete(new Request(`${url.origin}/img/${key}`, { method: 'GET' })));
+
     // --- GET /auth — verify a passcode before the user starts shooting, so a typo is
     // caught here instead of failing every upload in the queue eight times over.
+    // Hands back a short-lived token so the browser can stop holding the passcode. The
+    // passcode itself is then only ever typed once per event.
     if (url.pathname === '/auth' && req.method === 'GET') {
-      if (isManager) return json({ role: 'manager' }, env);
-      if (isPhotographer) return json({ role: 'photographer' }, env);
-      return unauthorized(env);
+      if (!auth.role) return unauthorized(env);
+      if (!env.TOKEN_SECRET) {
+        // Fail loudly rather than silently falling back to something weaker.
+        return json({ error: 'server_misconfigured' }, env, 500);
+      }
+      const { token, expiresAt } = await issueToken(
+        auth.role,
+        env.TOKEN_SECRET,
+        Math.floor(Date.now() / 1000)
+      );
+      return json({ role: auth.role, token, expiresAt }, env);
     }
 
     // --- POST /sign — photographer only. Records a pending row (the server owns key and
@@ -176,6 +239,36 @@ export default {
       // for the audience, so the cache is left alone.
       if (moderation === 'approved') purgeWall(row.event_date);
       return json({ ok: true, moderation }, env);
+    }
+
+    // --- GET /img/<key> — public. Serves the photo out of R2 through the Worker, which
+    // avoids the rate-limited r2.dev host without needing a custom domain on the bucket.
+    // Keys contain a uuid and objects are immutable, so this caches essentially forever
+    // and a warm edge answers without touching R2 at all.
+    if (url.pathname.startsWith('/img/') && req.method === 'GET') {
+      const key = decodeURIComponent(url.pathname.slice('/img/'.length));
+      if (!/^events\/\d{4}-\d{2}-\d{2}\/[\w-]{8,}\.avif$/.test(key)) return badInput(env);
+
+      const cache = caches.default;
+      const cacheKey = new Request(`${url.origin}/img/${key}`, { method: 'GET' });
+      const hit = await cache.match(cacheKey);
+      if (hit) return hit;
+
+      const obj = await env.BUCKET.get(key);
+      if (!obj) return json({ error: 'not_found' }, env, 404);
+
+      const res = new Response(obj.body, {
+        headers: {
+          'content-type': 'image/avif',
+          'cache-control': 'public, max-age=31536000, immutable',
+          etag: obj.httpEtag,
+          // Images are loaded as <img>, not fetched, but a permissive header keeps
+          // canvas/download paths working from the app origin.
+          'access-control-allow-origin': '*'
+        }
+      });
+      ctx.waitUntil(cache.put(cacheKey, res.clone()));
+      return res;
     }
 
     // --- GET /wall — public. Approved photos for one night, edge-cached. This is the read
@@ -306,6 +399,7 @@ export default {
         return json({ error: 'storage_delete_failed' }, env, 502);
       }
       await env.DB.prepare(`DELETE FROM photos WHERE id=?`).bind(body.id).run();
+      purgeImage(row.r2_key); // the bytes are gone; the edge must not keep serving them
       return json({ ok: true }, env);
     }
 

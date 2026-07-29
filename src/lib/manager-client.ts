@@ -1,13 +1,14 @@
 import type { EventSettings, Moderation, PhotoListItem, FetchLike } from './types';
+import type { AuthHeaders } from './session';
 
 export interface ManagerDeps {
   workerUrl: string;
-  passcode: string;
+  auth: AuthHeaders;
   fetchImpl?: FetchLike;
 }
 
-const headers = (deps: ManagerDeps) => ({
-  'x-manager-passcode': deps.passcode,
+const postHeaders = async (deps: ManagerDeps) => ({
+  ...(await deps.auth()),
   'content-type': 'application/json'
 });
 
@@ -20,7 +21,7 @@ export async function fetchList(deps: ManagerDeps, date: string): Promise<ListRe
   const f = deps.fetchImpl ?? fetch;
   const res = await f(`${deps.workerUrl}/list?date=${encodeURIComponent(date)}`, {
     method: 'GET',
-    headers: { 'x-manager-passcode': deps.passcode },
+    headers: await deps.auth(),
     cache: 'no-store'
   });
   if (!res.ok) throw new Error(`list failed ${res.status}`);
@@ -37,7 +38,7 @@ export async function moderatePhoto(
   const f = deps.fetchImpl ?? fetch;
   const res = await f(`${deps.workerUrl}/moderate`, {
     method: 'POST',
-    headers: headers(deps),
+    headers: await postHeaders(deps),
     body: JSON.stringify({ id, action })
   });
   if (!res.ok) throw new Error(`moderate failed ${res.status}`);
@@ -54,7 +55,7 @@ export async function moderateAll(
   const f = deps.fetchImpl ?? fetch;
   const res = await f(`${deps.workerUrl}/moderate`, {
     method: 'POST',
-    headers: headers(deps),
+    headers: await postHeaders(deps),
     body: JSON.stringify({ date, action, all: true })
   });
   if (!res.ok) throw new Error(`moderate all failed ${res.status}`);
@@ -67,7 +68,7 @@ export async function deletePhoto(deps: ManagerDeps, id: string): Promise<void> 
   const f = deps.fetchImpl ?? fetch;
   const res = await f(`${deps.workerUrl}/delete`, {
     method: 'POST',
-    headers: headers(deps),
+    headers: await postHeaders(deps),
     body: JSON.stringify({ id })
   });
   if (!res.ok) throw new Error(`delete failed ${res.status}`);
@@ -80,7 +81,7 @@ export async function saveEvent(
   const f = deps.fetchImpl ?? fetch;
   const res = await f(`${deps.workerUrl}/event`, {
     method: 'POST',
-    headers: headers(deps),
+    headers: await postHeaders(deps),
     body: JSON.stringify(settings)
   });
   if (!res.ok) throw new Error(`event save failed ${res.status}`);

@@ -11,8 +11,7 @@
     deletePhoto,
     saveEvent
   } from '$lib/manager-client';
-  import { verifyPasscode } from '$lib/auth-client';
-  import { loadManagerPasscode, saveManagerPasscode, clearPasscodes } from '$lib/session';
+  import { Session } from '$lib/session';
   import type { EventSettings, Moderation, PhotoListItem } from '$lib/types';
 
   let passcode = $state('');
@@ -29,7 +28,8 @@
   let lightbox = $state<PhotoListItem | null>(null);
   let busy = $state<Record<string, boolean>>({});
 
-  const deps = $derived({ workerUrl: config.workerUrl, passcode });
+  const session = new Session(config.workerUrl, 'manager');
+  const deps = { workerUrl: config.workerUrl, auth: () => session.headers() };
 
   const counts = $derived({
     pending: photos.filter((p) => p.moderation === 'pending').length,
@@ -64,23 +64,27 @@
     loginError = '';
     checking = true;
     try {
-      const role = await verifyPasscode({ workerUrl: config.workerUrl }, passcode, 'manager');
-      if (role !== 'manager') {
-        loginError = 'Λάθος κωδικός.';
+      const result = await session.signIn(passcode);
+      if (result === 'bad') {
+        loginError = 'Λάθος κωδικός, ή πολλές αποτυχημένες προσπάθειες. Δοκίμασε ξανά σε ένα λεπτό.';
         return;
       }
-      saveManagerPasscode(passcode);
+      if (result === 'offline') {
+        // Unlike the photographer, the manager has nothing useful to do offline: every
+        // action needs the server.
+        loginError = 'Δεν υπάρχει σύνδεση με τον διακομιστή.';
+        return;
+      }
+      passcode = '';
       loggedIn = true;
       await loadList();
-    } catch {
-      loginError = 'Δεν υπάρχει σύνδεση με τον διακομιστή.';
     } finally {
       checking = false;
     }
   }
 
   function logout() {
-    clearPasscodes();
+    session.signOut();
     loggedIn = false;
     passcode = '';
     photos = [];
@@ -160,9 +164,8 @@
         : { text: 'Για έγκριση', cls: 'chip-warn' };
 
   onMount(() => {
-    const saved = loadManagerPasscode();
-    if (saved) {
-      passcode = saved;
+    // A token from earlier in this tab means no passcode prompt.
+    if (session.restore()) {
       loggedIn = true;
       loadList();
     }

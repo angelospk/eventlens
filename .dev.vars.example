@@ -3,5 +3,12 @@
 # gives their values back — if you lose one, you set a new one, you don't recover it.
 PASSCODE="choose-a-photographer-passcode"
 MANAGER_PASSCODE="choose-a-different-manager-passcode"
+# Signs the short-lived login tokens. Must be long and random, and must NOT be one of the
+# passcodes: a stolen token would otherwise let someone brute force the passcode offline.
+#   openssl rand -base64 32
+TOKEN_SECRET=""
 R2_ACCESS_KEY_ID=""
 R2_SECRET_ACCESS_KEY=""
+# Local dev only: the deployed value is the GitHub Pages origin, which would block a
+# browser running on localhost. `wrangler dev` reads this file and overrides [vars].
+ALLOWED_ORIGIN="http://localhost:5173"

@@ -13,14 +13,22 @@ migrations_dir = "worker/migrations"
 binding = "BUCKET"
 bucket_name = "eventlens"
 
+# Throttles wrong passcodes. Only failed credential checks are counted, so a busy event
+# never trips it. The limit is per Cloudflare location rather than global, which is fine
+# for slowing down a brute force but is not a global quota.
+[[ratelimits]]
+name = "AUTH_LIMITER"
+namespace_id = "1001"
+simple = { limit = 10, period = 60 }
+
 # Secrets (set via `wrangler secret put`):
 #   PASSCODE, MANAGER_PASSCODE, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY
 [vars]
 R2_BUCKET = "eventlens"
 R2_ACCOUNT_ID = "aec2a7c0bf16c5229ab4790e5bf3100f"
-# Where guests load the photos from. r2.dev is rate-limited and dev-only, so a busy
-# public page needs a custom domain on the bucket. Photo URLs are derived from this at
-# read time, so flipping it fixes up past photos too.
-PUBLIC_BASE = "https://pub-8cc0fc35edf94016a199f64267c2bb34.r2.dev"
-# PUBLIC_BASE = "https://photos.haroldpoi.dev"   # ← switch to this once the R2 custom domain is live
+# Where guests load the photos from. The Worker serves the objects itself from /img, so no
+# custom domain is required and the rate-limited r2.dev host is out of the picture. Photo
+# URLs are derived from this at read time, so flipping it fixes up past photos too.
+PUBLIC_BASE = "https://eventlens-worker.angelos-papamichail.workers.dev/img"
+# PUBLIC_BASE = "https://photos.example.gr"   # ← if an R2 custom domain is ever added
 ALLOWED_ORIGIN = "https://angelospk.github.io"    # exact deployed app origin (GitHub Pages)
