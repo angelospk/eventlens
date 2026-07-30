@@ -34,11 +34,22 @@ export interface Diagnosis {
  */
 function humanError(e: unknown): string {
   const raw = e instanceof Error ? e.message : String(e);
-  if (/failed to fetch|load failed|networkerror|network request failed/i.test(raw)) {
+  if (e instanceof DOMException && e.name === 'AbortError') {
+    return 'Ο διακομιστής δεν απάντησε εγκαίρως. Η σύνδεση είναι πολύ αργή ή έπεσε.';
+  }
+  if (/failed to fetch|load failed|networkerror|network request failed|aborted/i.test(raw)) {
     return 'Δεν έφτασε στον διακομιστή. Έλεγξε το δίκτυο και ξαναδοκίμασε.';
   }
   return raw;
 }
+
+/**
+ * A check that never returns is worse than one that fails: the photographer is left
+ * watching a spinner on the one screen that exists to tell them what is wrong. A festival
+ * hotspot that accepts connections and then goes silent is exactly the case here.
+ */
+const CHECK_TIMEOUT_MS = 12_000;
+const withTimeout = () => AbortSignal.timeout(CHECK_TIMEOUT_MS);
 
 export interface DiagnoseDeps {
   workerUrl: string;
@@ -149,7 +160,11 @@ export async function diagnose(deps: DiagnoseDeps): Promise<Diagnosis> {
   // --- 5. Credentials.
   let authed = false;
   try {
-    const res = await f(`${deps.workerUrl}/auth`, { headers: await deps.auth(), cache: 'no-store' });
+    const res = await f(`${deps.workerUrl}/auth`, {
+      headers: await deps.auth(),
+      cache: 'no-store',
+      signal: withTimeout()
+    });
     authed = res.ok;
     checks.push(
       res.ok
@@ -163,12 +178,8 @@ export async function diagnose(deps: DiagnoseDeps): Promise<Diagnosis> {
                 : 'Απορρίφθηκε. Κάνε έξοδο και ξαναμπές.'
           }
     );
-  } catch {
-    checks.push({
-      name: 'Κωδικός',
-      state: 'warn',
-      detail: 'Δεν απαντά ο διακομιστής. Μάλλον είναι το δίκτυο, όχι ο κωδικός.'
-    });
+  } catch (e) {
+    checks.push({ name: 'Κωδικός', state: 'warn', detail: humanError(e) });
   }
 
   // --- 6. The whole upload path, for real.
@@ -179,7 +190,8 @@ export async function diagnose(deps: DiagnoseDeps): Promise<Diagnosis> {
       const signRes = await f(`${deps.workerUrl}/sign`, {
         method: 'POST',
         headers: { ...(await deps.auth()), 'content-type': 'application/json' },
-        body: JSON.stringify({ id, eventDate: deps.eventDate, originalName: 'doctor', ext: format.ext })
+        body: JSON.stringify({ id, eventDate: deps.eventDate, originalName: 'doctor', ext: format.ext }),
+        signal: withTimeout()
       });
       if (!signRes.ok && signRes.status !== 409) throw new Error(`υπογραφή ${signRes.status}`);
       if (signRes.status === 409) {
@@ -194,7 +206,8 @@ export async function diagnose(deps: DiagnoseDeps): Promise<Diagnosis> {
         const put = await f(uploadUrl, {
           method: 'PUT',
           headers: { 'content-type': format.mime },
-          body: blob
+          body: blob,
+          signal: withTimeout()
         });
         if (!put.ok) throw new Error(`αποστολή ${put.status}`);
         checks.push({

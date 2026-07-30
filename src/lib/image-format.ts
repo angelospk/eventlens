@@ -21,26 +21,37 @@ export interface OutputFormat {
 export const JPEG: OutputFormat = { mime: 'image/jpeg', ext: 'jpg' };
 export const WEBP: OutputFormat = { mime: 'image/webp', ext: 'webp' };
 
-/** 'auto' picks the smallest format the device can manage; the rest force one. */
+/**
+ * 'auto' prefers WebP wherever the device can encode it, natively or through WebAssembly,
+ * and falls back to JPEG. It does not compare output sizes per photograph; WebP simply
+ * wins on every frame we have measured.
+ */
 export type FormatPreference = 'auto' | 'webp' | 'jpeg';
 
 const PREF_KEY = 'eventlens.format.v1';
 
+// Held in the module as well as in storage. Safari in private browsing throws on every
+// storage call, and there the choice would otherwise be forgotten the instant it was made,
+// which is exactly when someone is changing it to work around a broken encoder.
+let memoryPref: FormatPreference | null = null;
+
 export function loadPreference(): FormatPreference {
   try {
     const v = localStorage.getItem(PREF_KEY);
-    return v === 'webp' || v === 'jpeg' ? v : 'auto';
+    if (v === 'webp' || v === 'jpeg') return v;
+    return memoryPref ?? 'auto';
   } catch {
-    return 'auto';
+    return memoryPref ?? 'auto';
   }
 }
 
 export function savePreference(pref: FormatPreference) {
+  memoryPref = pref === 'auto' ? null : pref;
   try {
     if (pref === 'auto') localStorage.removeItem(PREF_KEY);
     else localStorage.setItem(PREF_KEY, pref);
   } catch {
-    // Not remembered across reloads; the session still honours it.
+    // Not remembered across reloads, but honoured for the rest of this session.
   }
   cached = null; // the next photograph re-decides
 }

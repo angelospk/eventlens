@@ -130,6 +130,19 @@ export class IdbStore implements QueueStore {
     );
   }
 
+  /**
+   * Releases the connection. Matters on the fallback path: a database that opens but then
+   * refuses transactions would otherwise keep an idle connection alive, and an open
+   * connection is exactly what blocks another tab from upgrading the schema.
+   */
+  async close() {
+    try {
+      (await this.dbp).close();
+    } catch {
+      // Never opened, or already closed.
+    }
+  }
+
   async wasSent(fingerprint: string) {
     const row = await tx<{ fingerprint: string } | undefined>(
       await this.dbp,
@@ -201,6 +214,7 @@ export async function createQueueStorage(dbName = 'eventlens-queue'): Promise<Qu
     await idb.all();
     return { store: idb, ephemeral: false };
   } catch (e) {
+    await idb.close();
     return {
       store: new MemoryStore(),
       ephemeral: true,
