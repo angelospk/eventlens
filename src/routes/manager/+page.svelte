@@ -482,6 +482,13 @@
     margin-bottom: 1.5rem;
   }
 
+  /* Grid and flex children default to min-width:auto, which means they refuse to shrink
+     below their content. The public link is one long unbreakable string, so without this
+     it pushes the whole card wider than the phone and the page scrolls sideways. */
+  .settings > * {
+    min-width: 0;
+  }
+
   @media (min-width: 760px) {
     .settings {
       grid-template-columns: 1fr 1fr 1fr;

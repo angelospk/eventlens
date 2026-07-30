@@ -236,7 +236,7 @@ test('the photographer is told a network failure in plain language, not a stack 
   q.stop();
 
   const [stored] = await store.all();
-  expect(stored.lastError).toBe('Δεν έφυγε — χωρίς σύνδεση. Θα ξαναδοκιμάσει μόνο του.');
+  expect(stored.lastError).toBe('Δεν έφυγε, δεν υπάρχει σύνδεση. Θα ξαναδοκιμάσει μόνο του.');
   expect(stored.lastError).not.toContain('fetch');
 });
 
@@ -355,4 +355,24 @@ test('createQueueStorage always returns a usable queue', async () => {
   await storage.store.add(item('probe'));
   expect((await storage.store.all()).map((i) => i.id)).toContain('probe');
   await storage.store.remove('probe');
+});
+
+test('a struggling photograph drifts behind the ones that have not failed', async () => {
+  const store = new MemStore();
+  // 'sticky' was shot first but has already failed twice; the other two are fresh.
+  await store.add({ ...item('sticky'), queuedAt: 1, tries: 2 });
+  await store.add({ ...item('fresh-a'), queuedAt: 2 });
+  await store.add({ ...item('fresh-b'), queuedAt: 3 });
+
+  const order: string[] = [];
+  const q = new UploadQueue(
+    store,
+    { async run(it: QueueItem) { order.push(it.id); } },
+    { baseMs: 1, maxMs: 4, maxAttempts: 8 }
+  );
+  await q.drain();
+
+  // Oldest-first alone would have put 'sticky' first and made every later photo wait.
+  expect(order).toEqual(['fresh-a', 'fresh-b', 'sticky']);
+  expect(q.completed).toBe(3); // and it still gets its turn
 });

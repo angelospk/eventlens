@@ -148,8 +148,15 @@ export class UploadQueue {
             if (this.stopped) return;
             const items = (await this.store.all())
               .filter((i) => isRunnable(i, this.retry.maxAttempts) && !skip.has(i.id))
-              // Oldest first, so the night uploads in the order it was shot.
-              .sort((a, b) => (a.queuedAt ?? 0) - (b.queuedAt ?? 0));
+              // Fewest attempts first, then oldest.
+              //
+              // Plain oldest-first means one troublesome photograph, an enormous file or one
+              // that keeps timing out, takes the front of the queue on every single pass and
+              // everything shot after it waits behind. Ordering by attempts lets a struggling
+              // photo drift to the back on its own: it is still retried, just after the ones
+              // that have not failed yet. Nothing is skipped, nothing is lost, the healthy
+              // majority simply stops paying for the exception.
+              .sort((a, b) => (a.tries ?? 0) - (b.tries ?? 0) || (a.queuedAt ?? 0) - (b.queuedAt ?? 0));
             if (items.length === 0) break;
             const now = Date.now();
             // Prefer an item whose backoff has elapsed (or never failed).

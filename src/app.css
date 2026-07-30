@@ -57,6 +57,9 @@ body {
 
 body {
   min-height: 100dvh;
+  /* Backstop. Individual overflows are fixed where they occur, but on a phone at an event
+     a page that slides sideways is worse than a clipped edge. */
+  overflow-x: clip;
 }
 
 h1,

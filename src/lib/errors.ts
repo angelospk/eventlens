@@ -48,7 +48,7 @@ export const isNonRetryable = (e: unknown): e is NonRetryableError =>
  * find the person with the passcode.
  */
 export function describeError(e: unknown): string {
-  if (isNetworkError(e)) return 'Δεν έφυγε — χωρίς σύνδεση. Θα ξαναδοκιμάσει μόνο του.';
+  if (isNetworkError(e)) return 'Δεν έφυγε, δεν υπάρχει σύνδεση. Θα ξαναδοκιμάσει μόνο του.';
   if (isNonRetryable(e)) {
     switch (e.code) {
       case 'unauthorized':
@@ -62,7 +62,7 @@ export function describeError(e: unknown): string {
   const text = e instanceof Error ? e.message : String(e);
   // Anything the browser throws from fetch lands here as a TypeError with a vague message.
   if (/fetch|network|load failed/i.test(text)) {
-    return 'Δεν έφυγε — χωρίς σύνδεση. Θα ξαναδοκιμάσει μόνο του.';
+    return 'Δεν έφυγε, δεν υπάρχει σύνδεση. Θα ξαναδοκιμάσει μόνο του.';
   }
   return 'Κάτι πήγε στραβά στην αποστολή. Θα ξαναδοκιμάσει μόνο του.';
 }

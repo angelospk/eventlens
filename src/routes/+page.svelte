@@ -9,6 +9,8 @@
   import { makeR2Uploader, type Stage } from '$lib/r2-client';
   import { Session } from '$lib/session';
   import { fingerprintOf } from '$lib/fingerprint';
+  import { diagnose, type Diagnosis } from '$lib/diagnostics';
+  import { loadPreference, savePreference, type FormatPreference } from '$lib/image-format';
   import type { QueueItem } from '$lib/types';
 
   let passcode = $state('');
@@ -28,6 +30,10 @@
   let unverified = $state(false);
   // True when the queue lives only in memory because the database would not open.
   let ephemeral = $state(false);
+  let doctorOpen = $state(false);
+  let doctorRunning = $state(false);
+  let doctor = $state<Diagnosis | null>(null);
+  let formatPref = $state<FormatPreference>('auto');
   let queue: UploadQueue;
   let store: QueueStorage['store'];
   // A manager's token is accepted here too: same person, and being asked for a second
@@ -76,6 +82,28 @@
     if (unverified && session.verified) unverified = false;
   }
 
+  async function runDoctor() {
+    doctorRunning = true;
+    doctorOpen = true;
+    try {
+      doctor = await diagnose({
+        workerUrl: config.workerUrl,
+        auth: () => session.headers(),
+        eventDate
+      });
+    } finally {
+      doctorRunning = false;
+    }
+  }
+
+  function setFormat(pref: FormatPreference) {
+    formatPref = pref;
+    savePreference(pref);
+    // The queue re-asks for the format on the next photograph, so anything already failing
+    // is worth retrying under the new choice.
+    queue?.retryAll();
+  }
+
   async function start() {
     // Falls back to an in-memory queue rather than refusing to accept photographs when the
     // database will not open. Losing the queue on reload beats not being able to upload.
@@ -89,6 +117,7 @@
     });
     queue = new UploadQueue(store, uploader, config.retry, refresh);
     loggedIn = true;
+    formatPref = loadPreference();
     refresh();
     queue.drain(); // resume anything left from a previous session
   }
@@ -312,6 +341,7 @@
       </div>
       <span class="chip {connection.cls}">{connection.text}</span>
       <a class="btn btn-sm" href="{base}/manager">Διαχείριση</a>
+      <button class="btn btn-sm" onclick={runDoctor}>Έλεγχος</button>
       <button class="btn btn-sm" onclick={logout}>Έξοδος</button>
     </header>
 
@@ -350,6 +380,57 @@
           Έτσι ανοίγει σαν εφαρμογή και δουλεύει και χωρίς δίκτυο.
         </span>
       </div>
+    {/if}
+
+
+    {#if doctorOpen}
+      <section class="doctor card">
+        <header class="doctor-head">
+          <strong>Έλεγχος συστήματος</strong>
+          <button class="btn btn-sm" onclick={() => (doctorOpen = false)}>Κλείσιμο</button>
+        </header>
+
+        {#if doctorRunning}
+          <p class="hint">Γίνεται έλεγχος, ανεβαίνει και μια δοκιμαστική εικόνα…</p>
+        {:else if doctor}
+          <ul class="doctor-list">
+            {#each doctor.checks as c (c.name)}
+              <li>
+                <span class="chip {c.state === 'ok' ? 'chip-ok' : c.state === 'warn' ? 'chip-warn' : 'chip-danger'}">
+                  {c.state === 'ok' ? 'Εντάξει' : c.state === 'warn' ? 'Προσοχή' : 'Πρόβλημα'}
+                </span>
+                <div>
+                  <strong>{c.name}</strong>
+                  <span class="hint">{c.detail}</span>
+                </div>
+              </li>
+            {/each}
+          </ul>
+
+          {#if doctor.suggestion}
+            <p class="hint" style="margin-top:.75rem">
+              Δοκίμασε να αλλάξεις τη μορφή σε
+              <strong>{doctor.suggestion === 'jpeg' ? 'JPEG' : 'WebP'}</strong> παρακάτω.
+            </p>
+          {/if}
+
+          <button class="btn btn-sm" style="margin-top:.75rem" onclick={runDoctor}>Ξανά</button>
+        {/if}
+
+        <div class="doctor-format">
+          <span class="setting-label">Μορφή αρχείων</span>
+          <div class="seg">
+            {#each [['auto', 'Αυτόματη'], ['webp', 'WebP'], ['jpeg', 'JPEG']] as [value, label] (value)}
+              <button class="seg-btn" class:on={formatPref === value}
+                      onclick={() => setFormat(value as FormatPreference)}>{label}</button>
+            {/each}
+          </div>
+          <p class="hint">
+            Η αυτόματη διαλέγει το μικρότερο που αντέχει η συσκευή. Το JPEG είναι μεγαλύτερο
+            αλλά δουλεύει παντού. Άλλαξέ το μόνο αν ο έλεγχος δείχνει πρόβλημα στην επεξεργασία.
+          </p>
+        </div>
+      </section>
     {/if}
 
     <label class="picker" for="files">
@@ -419,9 +500,9 @@
               {#if it.status === 'error' && it.lastError}
                 <span class="error">{it.lastError}</span>
               {:else if (it.tries ?? 0) > 1 && it.status !== 'uploading'}
-                <span class="hint" style="font-size:.75rem">
-                  Δοκιμή {it.tries} — περιμένει το δίκτυο
-                </span>
+                <!-- A raw attempt count reads as an alarm. What the photographer needs to
+                     know is that it is still trying and nothing is lost. -->
+                <span class="hint" style="font-size:.75rem">Περιμένει δίκτυο, ξαναδοκιμάζει μόνο του</span>
               {/if}
             </div>
             {#if it.status === 'error'}
@@ -438,6 +519,80 @@
 </div>
 
 <style>
+  .doctor {
+    margin-bottom: 1.25rem;
+  }
+
+  .doctor-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 1rem;
+    margin-bottom: 0.9rem;
+  }
+
+  .doctor-list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 0.7rem;
+  }
+
+  .doctor-list li {
+    display: flex;
+    gap: 0.7rem;
+    align-items: flex-start;
+  }
+
+  .doctor-list li > div {
+    display: flex;
+    flex-direction: column;
+    gap: 0.15rem;
+    min-width: 0;
+  }
+
+  .doctor-list strong {
+    font-size: 0.9rem;
+  }
+
+  .doctor-format {
+    margin-top: 1.1rem;
+    padding-top: 1.1rem;
+    border-top: 1px solid var(--line);
+  }
+
+  .setting-label {
+    display: block;
+    font-size: 0.82rem;
+    color: var(--text-dim);
+    margin-bottom: 0.45rem;
+  }
+
+  .seg {
+    display: inline-flex;
+    border: 1px solid var(--line);
+    border-radius: var(--r-pill);
+    overflow: hidden;
+    margin-bottom: 0.5rem;
+  }
+
+  .seg-btn {
+    font: inherit;
+    font-size: 0.85rem;
+    color: var(--text-dim);
+    background: var(--surface);
+    border: 0;
+    padding: 0.4rem 0.95rem;
+    cursor: pointer;
+  }
+
+  .seg-btn.on {
+    background: var(--accent-strong);
+    color: #fff;
+  }
+
   .stats {
     display: grid;
     grid-template-columns: repeat(3, 1fr);
