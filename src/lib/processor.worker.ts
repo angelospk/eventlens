@@ -13,6 +13,9 @@ export interface ProcessRequest {
   logoUrl: string;
   maxLongEdge: number;
   quality: number;
+  /** Long edge of the gallery thumbnail, 0 to skip it. */
+  thumbLongEdge: number;
+  thumbQuality: number;
   /** The exact type the upload was signed for. */
   mime: string;
   logoWidthFraction: number;
@@ -25,6 +28,8 @@ export type ProcessResponse =
       id: string;
       ok: true;
       buffer: ArrayBuffer;
+      /** Absent when the photograph was already small enough, or the thumbnail failed. */
+      thumb?: ArrayBuffer;
       width: number;
       height: number;
       mime: string;
@@ -213,7 +218,30 @@ async function process(req: ProcessRequest): Promise<ProcessResponse> {
 
     const blob = await encodeImage(canvas, ctx, req.quality, req.mime, W, H);
     const buf = await blob.arrayBuffer();
-    return { id: req.id, ok: true, buffer: buf, width: W, height: H, mime: req.mime };
+
+    // A small copy for the gallery, drawn from the frame that already carries the grade
+    // and the logo so the two never disagree. Visitors were downloading full frames to
+    // look at two-hundred-pixel tiles; on a field on mobile data that is most of the
+    // page weight for none of the benefit.
+    let thumbBuf: ArrayBuffer | undefined;
+    if (req.thumbLongEdge > 0 && Math.max(W, H) > req.thumbLongEdge) {
+      const ts = req.thumbLongEdge / Math.max(W, H);
+      const tw = Math.max(1, Math.round(W * ts));
+      const th = Math.max(1, Math.round(H * ts));
+      const tCanvas = new OffscreenCanvas(tw, th);
+      const tCtx = tCanvas.getContext('2d', { willReadFrequently: true });
+      if (tCtx) {
+        tCtx.drawImage(canvas, 0, 0, tw, th);
+        try {
+          const tBlob = await encodeImage(tCanvas, tCtx, req.thumbQuality, req.mime, tw, th);
+          thumbBuf = await tBlob.arrayBuffer();
+        } catch {
+          // A thumbnail is an optimisation, never a reason to lose the photograph.
+        }
+      }
+    }
+
+    return { id: req.id, ok: true, buffer: buf, thumb: thumbBuf, width: W, height: H, mime: req.mime };
   } catch (e) {
     src?.close();
     return { id: req.id, ok: false, error: e instanceof Error ? e.message : String(e) };

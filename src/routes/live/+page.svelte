@@ -136,7 +136,8 @@
     <div class="grid">
       {#each ordered as p, i (p.id)}
         <button class="cell" onclick={(e) => openAt(i, e)} aria-label="Άνοιγμα φωτογραφίας">
-          <img src={p.public_url} alt="" loading="lazy" decoding="async" onload={reportHeight} />
+          <img src={p.thumb_url ?? p.public_url} alt="" loading="lazy" decoding="async"
+               onload={reportHeight} />
         </button>
       {/each}
     </div>

@@ -68,7 +68,7 @@ export function makeR2Uploader(deps: R2UploaderDeps): Uploader {
         throw new AlreadyUploadedError(item.id);
       }
       if (!signRes.ok) throw classifyStatus(signRes.status, 'sign') ?? new Error(`sign failed ${signRes.status}`);
-      const { uploadUrl } = (await signRes.json()) as SignResult;
+      const { uploadUrl, thumbUploadUrl } = (await signRes.json()) as SignResult;
 
       // 2) Encode with the browser's own encoder. Fast enough that the photographer sees
       //    it as instant, unlike the WebAssembly encoder this replaced.
@@ -86,11 +86,30 @@ export function makeR2Uploader(deps: R2UploaderDeps): Uploader {
       });
       if (!put.ok) throw new Error(`put failed ${put.status}`);
 
+      // 3b) The gallery-sized copy, if there is one. Deliberately best-effort: the
+      //     photograph itself is already safely stored, and losing a thumbnail costs a
+      //     visitor some bytes, while failing the whole upload over it would cost the
+      //     photograph. The gallery falls back to the full frame when it is missing.
+      let hasThumb = false;
+      if (out.thumb && thumbUploadUrl) {
+        try {
+          const putThumb = await f(thumbUploadUrl, {
+            method: 'PUT',
+            headers: { 'content-type': fmt.mime },
+            body: out.thumb
+          });
+          hasThumb = putThumb.ok;
+        } catch {
+          hasThumb = false;
+        }
+      }
+
       // 4) Confirm metadata. Server already knows key/public_url from /sign;
       //    we only confirm + report dimensions. Idempotent on id.
       const meta: PhotoMeta = {
         id: item.id, original_name: item.originalName,
-        width: out.width, height: out.height, bytes: out.bytes
+        width: out.width, height: out.height, bytes: out.bytes,
+        hasThumb
       };
       stage(item.id, 'confirming');
       const metaRes = await f(`${deps.workerUrl}/meta`, {

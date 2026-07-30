@@ -59,6 +59,23 @@ describe('exportFilenames', () => {
     ).toEqual(['IMG_1.webp', 'IMG_1-2.webp', 'IMG_1-3.webp']);
   });
 
+  // The suffix has to dodge names that already exist too. Counting only the original
+  // stems produced IMG-2 twice here, and the second one overwrote the first on
+  // extraction: a photo lost with nothing to show for it.
+  it('does not collide with a name that a suffix would produce', () => {
+    const names = exportFilenames([item('a', 'IMG.jpg'), item('b', 'IMG.jpg'), item('c', 'IMG-2.jpg')]);
+    expect(new Set(names).size).toBe(3);
+    // The third photo really is called IMG-2, and IMG-2 is already taken by the
+    // suffixed second one, so it suffixes in turn rather than stealing the name.
+    expect(names).toEqual(['IMG.webp', 'IMG-2.webp', 'IMG-2-2.webp']);
+  });
+
+  // The manager is on macOS or Windows, where IMG.webp and img.webp are one file.
+  it('treats names that differ only in case as colliding', () => {
+    const names = exportFilenames([item('a', 'Photo.jpg'), item('b', 'photo.jpg')]);
+    expect(names[0]!.toLowerCase()).not.toBe(names[1]!.toLowerCase());
+  });
+
   it('strips path separators out of a hostile name', () => {
     expect(exportFilenames([item('a', '../../etc/passwd.jpg')])).toEqual(['.._.._etc_passwd.webp']);
   });
@@ -147,6 +164,14 @@ describe('buildZip', () => {
       const cdOffset = read32(z, eocd + 16);
       expect(cdOffset + cdSize).toBe(eocd);
     }
+  });
+
+  // Past these bounds the 16 and 32 bit header fields wrap and the archive is
+  // silently corrupt, which is worse than refusing to build it.
+  it('refuses to emit an archive that would overflow a classic zip field', () => {
+    const many = Array.from({ length: 0x10000 }, (_, i) => ({ name: `${i}.txt`, bytes: bytes('x') }));
+    expect(() => buildZip(many)).toThrow(/too many files/);
+    expect(() => buildZip([{ name: 'x'.repeat(0x10000), bytes: bytes('x') }])).toThrow(/too long/);
   });
 
   it('produces a valid empty archive', () => {

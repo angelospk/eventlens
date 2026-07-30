@@ -71,3 +71,29 @@ test('secretEquals matches only identical secrets', async () => {
   expect(await secretEquals('hunter2', 'hunter2 ')).toBe(false);
   expect(await secretEquals('short', 'a-much-longer-secret')).toBe(false);
 });
+
+// --- object key namespacing -------------------------------------------------------
+// The thumbnail key must never be constructible as a real photograph's key. Ids are
+// client-chosen and `_` is legal in them, so `<id>_t.webp` was ambiguous: a photograph
+// with id `abc_t` claimed the exact key used for the thumbnail of `abc`.
+const EVENT_PREFIX = 'events/';
+const thumbKeyFor = (key: string) =>
+  key.startsWith(EVENT_PREFIX) ? 'thumbs/' + key.slice(EVENT_PREFIX.length) : '';
+
+test('a thumbnail key can never collide with another photograph key', async () => {
+  const photo = (id: string) => `events/2026-07-30/${id}.webp`;
+
+  // The case that used to collide.
+  expect(thumbKeyFor(photo('abcdefgh'))).not.toBe(photo('abcdefgh_t'));
+  expect(thumbKeyFor(photo('abcdefgh'))).toBe('thumbs/2026-07-30/abcdefgh.webp');
+
+  // Thumbnails and photographs live in prefixes that cannot overlap at all.
+  for (const id of ['abcdefgh', 'abcdefgh_t', 'a_t_b_t_c', 'with-hyphens-1']) {
+    expect(thumbKeyFor(photo(id)).startsWith('thumbs/')).toBe(true);
+    expect(photo(id).startsWith('events/')).toBe(true);
+  }
+
+  // Two different photographs never share a thumbnail.
+  const keys = ['abcdefgh', 'abcdefgh_t', 'zzzzzzzz'].map((id) => thumbKeyFor(photo(id)));
+  expect(new Set(keys).size).toBe(keys.length);
+});

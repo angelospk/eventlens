@@ -47,14 +47,19 @@ export function pickExportStrategy(nav: ShareCapableNavigator | undefined): Expo
 export function exportFilenames(
   items: Array<{ id: string; original_name?: string | null; public_url: string }>
 ): string[] {
-  const used = new Map<string, number>();
+  // Every name that has actually been handed out, not just the originals. Counting
+  // originals alone means `IMG.jpg, IMG.jpg, IMG-2.jpg` produces `IMG-2` twice, and
+  // the second one quietly overwrites the first on extraction.
+  const used = new Set<string>();
   return items.map((item) => {
     const base = (item.original_name || item.id).replace(/\.[^./]+$/, '').replace(/[/\\]/g, '_');
     const ext = item.public_url.match(/\.(webp|jpg|jpeg|avif|png)(?:\?|$)/i)?.[1]?.toLowerCase() ?? 'webp';
-    const stem = `${base}.${ext}`;
-    const seen = used.get(stem) ?? 0;
-    used.set(stem, seen + 1);
-    return seen === 0 ? stem : `${base}-${seen + 1}.${ext}`;
+    let name = `${base}.${ext}`;
+    // Compared case-insensitively: the manager is on macOS or Windows, where a
+    // filesystem treats IMG.webp and img.webp as the same file.
+    for (let n = 2; used.has(name.toLowerCase()); n++) name = `${base}-${n}.${ext}`;
+    used.add(name.toLowerCase());
+    return name;
   });
 }
 
@@ -110,6 +115,18 @@ export function buildZip(entries: ZipEntry[], now: Date = new Date()): Uint8Arra
     bytes: e.bytes,
     crc: crc32(e.bytes)
   }));
+
+  // Classic-ZIP fields are 16 and 32 bit. Past these bounds the values wrap and the
+  // archive is silently corrupt, which is far worse than refusing to build it. Zip64
+  // would lift them, and is not worth carrying for a night of photos.
+  if (prepared.length > 0xffff) {
+    throw new Error(`too many files for one archive (${prepared.length}, limit 65535)`);
+  }
+  for (const e of prepared) {
+    if (e.nameBytes.length > 0xffff) throw new Error('a filename is too long for a zip entry');
+  }
+  const total = prepared.reduce((n, e) => n + e.bytes.length, 0);
+  if (total > 0xffffffff) throw new Error('archive would exceed the 4GB zip limit');
 
   const LOCAL = 30;
   const CENTRAL = 46;
@@ -211,22 +228,43 @@ export interface ExportProgress {
   phase: 'fetching' | 'packing' | 'sharing';
 }
 
+/**
+ * Everything is held in memory: the blobs, then a copy as bytes, then the finished
+ * archive. Peak is roughly three times the payload, and an iPhone kills the whole web
+ * process rather than throwing when that gets out of hand, which looks to the manager
+ * like the page reloaded and ate the selection. Refusing early with a number they can
+ * act on beats dying silently.
+ */
+export const MAX_EXPORT_BYTES = 250 * 1024 * 1024;
+
+export class ExportTooLargeError extends Error {
+  constructor(readonly bytes: number) {
+    super(`selection is too large to export in one go (${Math.round(bytes / 1024 / 1024)}MB)`);
+    this.name = 'ExportTooLargeError';
+  }
+}
+
 /** Fetch every selected photo, then hand the batch to the share sheet or to a zip. */
 export async function exportPhotos(
   items: ExportItem[],
   date: string,
-  onProgress?: (p: ExportProgress) => void
+  onProgress?: (p: ExportProgress) => void,
+  signal?: AbortSignal
 ): Promise<{ strategy: ExportStrategy; count: number }> {
   if (!items.length) return { strategy: 'zip', count: 0 };
   const names = exportFilenames(items);
-  const strategy = pickExportStrategy(typeof navigator === 'undefined' ? undefined : navigator);
+  let strategy = pickExportStrategy(typeof navigator === 'undefined' ? undefined : navigator);
 
   const blobs: Blob[] = [];
+  let bytes = 0;
   for (let i = 0; i < items.length; i++) {
     onProgress?.({ done: i, total: items.length, phase: 'fetching' });
-    const res = await fetch(items[i]!.public_url);
+    const res = await fetch(items[i]!.public_url, { signal });
     if (!res.ok) throw new Error(`download failed ${res.status}`);
-    blobs.push(await res.blob());
+    const blob = await res.blob();
+    bytes += blob.size;
+    if (bytes > MAX_EXPORT_BYTES) throw new ExportTooLargeError(bytes);
+    blobs.push(blob);
   }
 
   if (strategy === 'share') {
@@ -236,10 +274,14 @@ export async function exportPhotos(
       await (navigator as ShareCapableNavigator).share!({ files });
       return { strategy, count: files.length };
     } catch (e) {
-      // A user who taps Cancel is not an error — and must not silently get a zip
-      // downloaded instead, which would look like the cancel did nothing.
+      // Tapping Cancel is not a failure, and must not silently download a zip
+      // instead, which would make the cancel look like it did nothing.
       if (e instanceof DOMException && e.name === 'AbortError') return { strategy, count: 0 };
-      throw e;
+      // Anything else means the share sheet would not take the batch. The usual cause
+      // is that fetching the photos outlived the tap that authorised the share, so
+      // Safari refuses it. The files are already in hand, so fall back to a zip rather
+      // than making the manager start over.
+      strategy = 'zip';
     }
   }
 

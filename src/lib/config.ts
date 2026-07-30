@@ -22,6 +22,10 @@ export const config = {
   // iOS during decode + encode, and nothing downstream (wall, phones, downloads) gains
   // anything from more than this.
   maxLongEdge: 2560 as number, // 0 = no cap
+  // The gallery shows tiles a few hundred pixels wide, on screens up to 3x density. Below
+  // this they go soft on a good phone; above it, the page weight climbs for nothing.
+  thumbLongEdge: 640 as number, // 0 = no thumbnails
+  thumbQuality: 70,
   // Upload retry policy:
   retry: { baseMs: 1000, maxMs: 30000, maxAttempts: 8 }
 };

@@ -49,6 +49,8 @@ export interface QueueItem {
 
 export interface Processed {
   blob: Blob;
+  /** The gallery-sized copy. Absent when the photograph did not need one. */
+  thumb?: Blob;
   /** The format the upload was signed for: WebP everywhere it can, JPEG if not. */
   mime: string;
   width: number;
@@ -64,10 +66,18 @@ export interface PhotoMeta {
   width: number;
   height: number;
   bytes: number;
+  /** Whether the gallery-sized copy made it up too. */
+  hasThumb?: boolean;
 }
 
 // Returned by /sign.
-export interface SignResult { uploadUrl: string; publicUrl: string; key: string; }
+export interface SignResult {
+  uploadUrl: string;
+  /** Where the gallery-sized copy goes. Absent from older servers. */
+  thumbUploadUrl?: string;
+  publicUrl: string;
+  key: string;
+}
 
 // Where a confirmed photo stands with the manager. Separate from upload `status`: a photo
 // can be fully uploaded and still not be public.
@@ -77,6 +87,8 @@ export type Moderation = 'pending' | 'approved' | 'hidden';
 export interface PhotoListItem {
   id: string;
   public_url: string;
+  /** Gallery-sized copy. Falls back to public_url for photographs that predate thumbnails. */
+  thumb_url?: string;
   original_name: string | null;
   width: number;
   height: number;
@@ -99,6 +111,8 @@ export interface EventSettings {
 export interface WallPhoto {
   id: string;
   public_url: string;
+  /** Gallery-sized copy. Falls back to public_url for photographs that predate thumbnails. */
+  thumb_url?: string;
   created_at: string;
 }
 

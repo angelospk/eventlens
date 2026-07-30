@@ -21,6 +21,21 @@ interface Env {
 const PUBLIC_CACHE = 'public, max-age=5, s-maxage=15, stale-while-revalidate=60';
 
 const ID_RE = /^[\w-]{8,}$/;
+
+/**
+ * Thumbnails live under their own prefix rather than beside the original.
+ *
+ * The obvious scheme, `<id>.webp` next to `<id>_t.webp`, is unsafe: the client picks its
+ * own id and `_` is a legal id character, so a photograph with id `abc_t` would claim the
+ * exact key used for the thumbnail of `abc`, and one signed upload could overwrite the
+ * other. A separate prefix makes the two namespaces incapable of touching.
+ *
+ * `events/2026-07-30/abc.webp` -> `thumbs/2026-07-30/abc.webp`.
+ */
+const THUMB_PREFIX = 'thumbs/';
+const EVENT_PREFIX = 'events/';
+const thumbKeyFor = (key: string) =>
+  key.startsWith(EVENT_PREFIX) ? THUMB_PREFIX + key.slice(EVENT_PREFIX.length) : '';
 // What the browser's own encoder can produce, plus avif for photographs uploaded before
 // the switch away from the WebAssembly encoder.
 const EXT_TYPES: Record<string, string> = {
@@ -200,21 +215,31 @@ export default {
         }
       }
 
-      const target = `https://${env.R2_ACCOUNT_ID}.r2.cloudflarestorage.com/${env.R2_BUCKET}/${key}`;
       const client = new AwsClient({
         accessKeyId: env.R2_ACCESS_KEY_ID,
         secretAccessKey: env.R2_SECRET_ACCESS_KEY,
         service: 's3',
         region: 'auto'
       });
-      const signed = await client.sign(
-        new Request(`${target}?X-Amz-Expires=3600`, {
-          method: 'PUT',
-          headers: { 'content-type': contentType }
-        }),
-        { aws: { signQuery: true } }
-      );
-      return json({ uploadUrl: signed.url, publicUrl, key }, env);
+      const signFor = async (objectKey: string) => {
+        const target = `https://${env.R2_ACCOUNT_ID}.r2.cloudflarestorage.com/${env.R2_BUCKET}/${objectKey}`;
+        const signed = await client.sign(
+          new Request(`${target}?X-Amz-Expires=3600`, {
+            method: 'PUT',
+            headers: { 'content-type': contentType }
+          }),
+          { aws: { signQuery: true } }
+        );
+        return signed.url;
+      };
+
+      // Both URLs come back together so the client makes one round trip, not two. The
+      // thumbnail is optional: a client that cannot make one simply never uses this.
+      const [uploadUrl, thumbUploadUrl] = await Promise.all([
+        signFor(key),
+        signFor(thumbKeyFor(key))
+      ]);
+      return json({ uploadUrl, thumbUploadUrl, publicUrl, key }, env);
     }
 
     // --- POST /meta — photographer only. Confirms a pending row. Moderation state is
@@ -227,6 +252,7 @@ export default {
         width: number;
         height: number;
         bytes: number;
+        hasThumb?: boolean;
       }>(req);
       if (!m) return badInput(env);
       if (!ID_RE.test(m.id)) return badInput(env);
@@ -249,10 +275,10 @@ export default {
       const res = await env.DB.prepare(
         `UPDATE photos
          SET width=?, height=?, bytes=?, original_name=COALESCE(?, original_name),
-             status='confirmed', moderation=?
+             status='confirmed', moderation=?, has_thumb=?
          WHERE id=? AND status='pending'`
       )
-        .bind(m.width, m.height, m.bytes, m.original_name ?? null, moderation, m.id)
+        .bind(m.width, m.height, m.bytes, m.original_name ?? null, moderation, m.hasThumb ? 1 : 0, m.id)
         .run();
       if ((res.meta.changes ?? 0) === 0) return json({ error: 'unknown_or_confirmed' }, env, 404);
       // Only when the photo actually went public: during a reviewed night nothing changed
@@ -267,7 +293,9 @@ export default {
     // and a warm edge answers without touching R2 at all.
     if (url.pathname.startsWith('/img/') && req.method === 'GET') {
       const key = decodeURIComponent(url.pathname.slice('/img/'.length));
-      const match = /^events\/\d{4}-\d{2}-\d{2}\/[\w-]{8,}\.(webp|jpg|avif)$/.exec(key);
+      // Non-capturing prefix on purpose: match[1] stays the extension, which the
+      // content-type lookup below depends on.
+      const match = /^(?:events|thumbs)\/\d{4}-\d{2}-\d{2}\/[\w-]{8,}\.(webp|jpg|avif)$/.exec(key);
       if (!match) return badInput(env);
 
       const cache = caches.default;
@@ -309,13 +337,13 @@ export default {
         // stored column, so moving the bucket to a custom domain instantly fixes up every
         // past photo instead of only newly uploaded ones.
         env.DB.prepare(
-          `SELECT id, r2_key, created_at
+          `SELECT id, r2_key, has_thumb, created_at
            FROM photos
            WHERE event_date = ? AND status = 'confirmed' AND moderation = 'approved'
            ORDER BY created_at`
         )
           .bind(date)
-          .all<{ id: string; r2_key: string; created_at: string }>(),
+          .all<{ id: string; r2_key: string; has_thumb: number; created_at: string }>(),
         env.DB.prepare(`SELECT title FROM events WHERE event_date = ?`)
           .bind(date)
           .first<{ title: string | null }>()
@@ -324,6 +352,11 @@ export default {
       const photos = (results ?? []).map((p) => ({
         id: p.id,
         public_url: `${env.PUBLIC_BASE}/${p.r2_key}`,
+        // Photographs uploaded before thumbnails existed have none, so the gallery falls
+        // back to the full frame rather than showing a hole.
+        thumb_url: p.has_thumb
+          ? `${env.PUBLIC_BASE}/${thumbKeyFor(p.r2_key)}`
+          : `${env.PUBLIC_BASE}/${p.r2_key}`,
         created_at: p.created_at
       }));
 
@@ -339,21 +372,24 @@ export default {
       const date = url.searchParams.get('date') ?? '';
       if (!validDate(date)) return badInput(env);
       const { results } = await env.DB.prepare(
-        `SELECT id, r2_key, original_name, width, height, bytes, created_at, moderation
+        `SELECT id, r2_key, has_thumb, original_name, width, height, bytes, created_at, moderation
          FROM photos
          WHERE event_date = ? AND status = 'confirmed' AND moderation != 'deleting'
          ORDER BY created_at`
       )
         .bind(date)
-        .all<{ id: string; r2_key: string; [k: string]: unknown }>();
+        .all<{ id: string; r2_key: string; has_thumb: number; [k: string]: unknown }>();
       const ev = await env.DB.prepare(`SELECT title, auto_approve FROM events WHERE event_date = ?`)
         .bind(date)
         .first<{ title: string | null; auto_approve: number }>();
       return json(
         {
-          photos: (results ?? []).map(({ r2_key, ...p }) => ({
+          photos: (results ?? []).map(({ r2_key, has_thumb, ...p }) => ({
             ...p,
-            public_url: `${env.PUBLIC_BASE}/${r2_key}`
+            public_url: `${env.PUBLIC_BASE}/${r2_key}`,
+            thumb_url: has_thumb
+              ? `${env.PUBLIC_BASE}/${thumbKeyFor(r2_key)}`
+              : `${env.PUBLIC_BASE}/${r2_key}`
           })),
           event: { date, title: ev?.title ?? null, autoApprove: Boolean(ev?.auto_approve) }
         },
@@ -412,15 +448,20 @@ export default {
       await env.DB.prepare(`UPDATE photos SET moderation='deleting' WHERE id=?`).bind(body.id).run();
       // Pull it off the public page immediately, before the slower object delete.
       purgeWall(row.event_date);
+      const thumbKey = thumbKeyFor(row.r2_key);
       try {
-        await env.BUCKET.delete(row.r2_key);
+        // Both objects go, or neither does. Deleting the original while the thumbnail
+        // survives would leave the gallery showing a photograph that no longer exists.
+        await env.BUCKET.delete([row.r2_key, thumbKey]);
       } catch {
         // Object still there: the row stays 'deleting' (invisible everywhere) and a repeat
         // call retries the object delete.
         return json({ error: 'storage_delete_failed' }, env, 502);
       }
       await env.DB.prepare(`DELETE FROM photos WHERE id=?`).bind(body.id).run();
-      purgeImage(row.r2_key); // the bytes are gone; the edge must not keep serving them
+      // The bytes are gone; the edge must not keep serving either size.
+      purgeImage(row.r2_key);
+      purgeImage(thumbKey);
       return json({ ok: true }, env);
     }
 

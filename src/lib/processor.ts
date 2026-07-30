@@ -26,7 +26,8 @@ function ensureWorker(): Worker {
     pending.delete(res.id);
     if (res.ok) {
       const blob = new Blob([res.buffer], { type: res.mime });
-      entry.resolve({ blob, mime: res.mime, width: res.width, height: res.height, bytes: blob.size });
+      const thumb = res.thumb ? new Blob([res.thumb], { type: res.mime }) : undefined;
+      entry.resolve({ blob, thumb, mime: res.mime, width: res.width, height: res.height, bytes: blob.size });
     } else {
       // A processing failure is deterministic: the same file will fail the same way on
       // every retry, so it must not ride the network backoff ladder.
@@ -70,6 +71,8 @@ export async function processImage(file: Blob, mime: string): Promise<Processed>
     logoUrl: new URL(`${base}/${config.logoFile}`, location.href).href,
     maxLongEdge: config.maxLongEdge,
     quality: config.quality,
+    thumbLongEdge: config.thumbLongEdge,
+    thumbQuality: config.thumbQuality,
     mime,
     logoWidthFraction: config.logoWidthFraction,
     logoPaddingFraction: config.logoPaddingFraction,

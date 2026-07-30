@@ -376,3 +376,75 @@ test('a struggling photograph drifts behind the ones that have not failed', asyn
   expect(order).toEqual(['fresh-a', 'fresh-b', 'sticky']);
   expect(q.completed).toBe(3); // and it still gets its turn
 });
+
+test('a failed thumbnail does not fail the photograph', async () => {
+  // The full frame is already stored by this point. Losing the small copy costs a visitor
+  // some bytes; losing the photograph costs the photographer the shot.
+  let metaBody: any = null;
+  const uploader = makeR2Uploader({
+    workerUrl: 'https://wkr',
+    auth: async () => ({ authorization: 'Bearer tok' }),
+    process: async () => ({
+      blob: new Blob(['full']),
+      thumb: new Blob(['small']),
+      mime: 'image/webp',
+      width: 10,
+      height: 10,
+      bytes: 4
+    }),
+    fetchImpl: (async (url: string, opts: any) => {
+      const u = String(url);
+      if (u.endsWith('/sign')) {
+        return new Response(JSON.stringify({
+          uploadUrl: 'https://r2/full',
+          thumbUploadUrl: 'https://r2/thumb',
+          publicUrl: 'https://pub/x',
+          key: 'k'
+        }));
+      }
+      if (u === 'https://r2/thumb') throw new Error('thumbnail upload died');
+      if (u === 'https://r2/full') return new Response(null, { status: 200 });
+      if (u.endsWith('/meta')) {
+        metaBody = JSON.parse(opts.body);
+        return new Response('{"ok":true}');
+      }
+      return new Response('{}');
+    }) as any
+  });
+
+  await uploader.run(item('withthumb')); // must not throw
+  expect(metaBody.hasThumb).toBe(false); // and the server is told the truth
+});
+
+test('a successful thumbnail is reported so the gallery can use it', async () => {
+  let metaBody: any = null;
+  const seen: string[] = [];
+  const uploader = makeR2Uploader({
+    workerUrl: 'https://wkr',
+    auth: async () => ({ authorization: 'Bearer tok' }),
+    process: async () => ({
+      blob: new Blob(['full']),
+      thumb: new Blob(['small']),
+      mime: 'image/webp',
+      width: 10, height: 10, bytes: 4
+    }),
+    fetchImpl: (async (url: string, opts: any) => {
+      const u = String(url);
+      seen.push(u);
+      if (u.endsWith('/sign')) {
+        return new Response(JSON.stringify({
+          uploadUrl: 'https://r2/full',
+          thumbUploadUrl: 'https://r2/thumb',
+          publicUrl: 'https://pub/x', key: 'k'
+        }));
+      }
+      if (u.endsWith('/meta')) { metaBody = JSON.parse(opts.body); return new Response('{"ok":true}'); }
+      return new Response(null, { status: 200 });
+    }) as any
+  });
+
+  await uploader.run(item('good'));
+  expect(seen).toContain('https://r2/full');
+  expect(seen).toContain('https://r2/thumb');
+  expect(metaBody.hasThumb).toBe(true);
+});

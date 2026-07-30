@@ -10,7 +10,7 @@
     deletePhoto,
     saveEvent
   } from '$lib/manager-client';
-  import { downloadOne, exportPhotos, type ExportProgress } from '$lib/export-photos';
+  import { downloadOne, exportPhotos, ExportTooLargeError, type ExportProgress } from '$lib/export-photos';
   import { Session } from '$lib/session';
   import type { EventSettings, Moderation, PhotoListItem } from '$lib/types';
 
@@ -49,6 +49,21 @@
   const selectedItems = $derived(shown.filter((p) => selected[p.id]));
   const selectedCount = $derived(selectedItems.length);
   const allShownSelected = $derived(shown.length > 0 && selectedCount === shown.length);
+  /** True while a bulk action is in flight, so two of them cannot overlap. */
+  let batchBusy = $state(false);
+
+  // The toolbar counts and acts on what is visible, so a selection made under one
+  // filter would go invisible under another and then silently rejoin the batch on the
+  // way back. With Delete in that toolbar, that is a way to lose photos nobody meant
+  // to touch. Changing what is shown clears the selection.
+  let lastScope = $state('');
+  $effect(() => {
+    const scope = `${date}|${filter}`;
+    if (scope !== lastScope) {
+      lastScope = scope;
+      if (selectMode) exitSelect();
+    }
+  });
 
   function exitSelect() {
     selectMode = false;
@@ -68,9 +83,12 @@
   let pressTimer: ReturnType<typeof setTimeout> | null = null;
   let pressFired = false;
 
-  function pressStart(p: PhotoListItem) {
+  let pressOrigin: { x: number; y: number } | null = null;
+
+  function pressStart(e: PointerEvent, p: PhotoListItem) {
     if (selectMode) return;
     pressFired = false;
+    pressOrigin = { x: e.clientX, y: e.clientY };
     pressTimer = setTimeout(() => {
       pressFired = true;
       selectMode = true;
@@ -79,9 +97,24 @@
     }, 450);
   }
 
+  // A slow drag down the grid stays under the browser's pan threshold for a while, so
+  // without this the timer fires and the scroll turns into a selection.
+  function pressMove(e: PointerEvent) {
+    if (!pressOrigin || !pressTimer) return;
+    if (Math.hypot(e.clientX - pressOrigin.x, e.clientY - pressOrigin.y) > 10) pressCancel();
+  }
+
   function pressCancel() {
     if (pressTimer) clearTimeout(pressTimer);
     pressTimer = null;
+    pressOrigin = null;
+  }
+
+  // pointercancel fires without a following click, so a pressFired left standing here
+  // would swallow the next genuine tap on a tile.
+  function pressAbort() {
+    pressCancel();
+    pressFired = false;
   }
 
   function tileClick(e: MouseEvent, p: PhotoListItem) {
@@ -96,47 +129,74 @@
     else lightbox = p;
   }
 
+  let exportAbort: AbortController | null = null;
+
   async function exportSelected() {
     const items = selectedItems;
     if (!items.length || exporting) return;
     error = '';
     exporting = { done: 0, total: items.length, phase: 'fetching' };
+    exportAbort = new AbortController();
     try {
-      const res = await exportPhotos(items, date, (p) => (exporting = p));
-      // count 0 means the share sheet was dismissed — leave the selection alone so
-      // the manager can just tap again.
+      const res = await exportPhotos(items, date, (p) => (exporting = p), exportAbort.signal);
+      // count 0 means the share sheet was dismissed. Leave the selection alone so the
+      // manager can just tap again.
       if (res.count > 0) exitSelect();
-    } catch {
-      error = 'Η λήψη απέτυχε. Δοκίμασε ξανά.';
+    } catch (e) {
+      if (e instanceof ExportTooLargeError) {
+        error = `Πολλές φωτογραφίες μαζί (${Math.round(e.bytes / 1024 / 1024)}MB). Διάλεξε λιγότερες.`;
+      } else if (!(e instanceof DOMException && e.name === 'AbortError')) {
+        error = 'Η λήψη απέτυχε. Δοκίμασε ξανά.';
+      }
     } finally {
       exporting = null;
+      exportAbort = null;
     }
+  }
+
+  /** Cancelling has to stop the transfer too, not just tidy the toolbar away. */
+  function cancelSelect() {
+    exportAbort?.abort();
+    exitSelect();
   }
 
   /** Same moderation action across the selection, one call per photo. */
   async function moderateSelected(action: 'approve' | 'hide') {
     const items = selectedItems;
-    if (!items.length) return;
-    for (const p of items) await setModeration(p, action);
-    exitSelect();
+    if (!items.length || batchBusy) return;
+    batchBusy = true;
+    try {
+      // Sequential, and the whole toolbar is disabled meanwhile. Letting Approve and
+      // Hide overlap lets the two requests land server-side in the other order, and the
+      // optimistic UI would then claim "hidden" for a photo that is actually public.
+      for (const p of items) await setModeration(p, action);
+      exitSelect();
+    } finally {
+      batchBusy = false;
+    }
   }
 
   async function removeSelected() {
     const items = selectedItems;
-    if (!items.length) return;
+    if (!items.length || batchBusy) return;
     if (!confirm(`Οριστική διαγραφή ${items.length} φωτογραφιών;`)) return;
-    for (const p of items) {
-      busy = { ...busy, [p.id]: true };
-      try {
-        await deletePhoto(deps, p.id);
-        photos = photos.filter((x) => x.id !== p.id);
-      } catch {
-        error = 'Κάποιες φωτογραφίες δεν διαγράφηκαν.';
-      } finally {
-        busy = { ...busy, [p.id]: false };
+    batchBusy = true;
+    try {
+      for (const p of items) {
+        busy = { ...busy, [p.id]: true };
+        try {
+          await deletePhoto(deps, p.id);
+          photos = photos.filter((x) => x.id !== p.id);
+        } catch {
+          error = 'Κάποιες φωτογραφίες δεν διαγράφηκαν.';
+        } finally {
+          busy = { ...busy, [p.id]: false };
+        }
       }
+      exitSelect();
+    } finally {
+      batchBusy = false;
     }
-    exitSelect();
   }
 
   const liveUrl = $derived(
@@ -374,7 +434,7 @@
         <span class="sel-spacer"></span>
         <button
           class="btn btn-sm btn-primary"
-          disabled={selectedCount === 0 || !!exporting}
+          disabled={selectedCount === 0 || !!exporting || batchBusy}
           onclick={exportSelected}
         >
           {#if exporting}
@@ -387,16 +447,16 @@
             Λήψη
           {/if}
         </button>
-        <button class="btn btn-sm" disabled={selectedCount === 0} onclick={() => moderateSelected('approve')}>
+        <button class="btn btn-sm" disabled={selectedCount === 0 || batchBusy} onclick={() => moderateSelected('approve')}>
           Έγκριση
         </button>
-        <button class="btn btn-sm" disabled={selectedCount === 0} onclick={() => moderateSelected('hide')}>
+        <button class="btn btn-sm" disabled={selectedCount === 0 || batchBusy} onclick={() => moderateSelected('hide')}>
           Απόκρυψη
         </button>
-        <button class="btn btn-sm btn-danger" disabled={selectedCount === 0} onclick={removeSelected}>
+        <button class="btn btn-sm btn-danger" disabled={selectedCount === 0 || batchBusy} onclick={removeSelected}>
           Διαγραφή
         </button>
-        <button class="btn btn-sm" onclick={exitSelect}>Άκυρο</button>
+        <button class="btn btn-sm" onclick={cancelSelect}>Άκυρο</button>
       </div>
     {/if}
 
@@ -419,17 +479,18 @@
             <button
               class="tile-img"
               onclick={(e) => tileClick(e, p)}
-              onpointerdown={() => pressStart(p)}
+              onpointerdown={(e) => pressStart(e, p)}
               onpointerup={pressCancel}
-              onpointerleave={pressCancel}
-              onpointercancel={pressCancel}
+              onpointermove={pressMove}
+              onpointerleave={pressAbort}
+              onpointercancel={pressAbort}
               oncontextmenu={(e) => selectMode && e.preventDefault()}
               aria-pressed={selectMode ? !!selected[p.id] : undefined}
               aria-label={selectMode
                 ? `${selected[p.id] ? 'Αποεπιλογή' : 'Επιλογή'} φωτογραφίας`
                 : 'Άνοιγμα φωτογραφίας'}
             >
-              <img src={p.public_url} alt={p.original_name ?? ''} loading="lazy" />
+              <img src={p.thumb_url ?? p.public_url} alt={p.original_name ?? ''} loading="lazy" />
               {#if selectMode}
                 <span class="tick" aria-hidden="true">{selected[p.id] ? '✓' : ''}</span>
               {/if}
