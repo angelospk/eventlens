@@ -53,10 +53,21 @@ test('malformed tokens are rejected rather than throwing', async () => {
   }
 });
 
+test('an unset secret locks the door instead of opening it', async () => {
+  // An unconfigured binding is `undefined`, and TextEncoder turns that into the empty
+  // string. Without an explicit guard, a request sending an empty header would hash to the
+  // same value and be accepted as valid.
+  expect(await secretEquals('', undefined)).toBe(false);
+  expect(await secretEquals('', '')).toBe(false);
+  expect(await secretEquals(undefined, undefined)).toBe(false);
+  expect(await secretEquals('anything', undefined)).toBe(false);
+  expect(await secretEquals(undefined, 'anything')).toBe(false);
+  expect(await secretEquals(null, null)).toBe(false);
+});
+
 test('secretEquals matches only identical secrets', async () => {
   expect(await secretEquals('hunter2', 'hunter2')).toBe(true);
   expect(await secretEquals('hunter2', 'hunter3')).toBe(false);
   expect(await secretEquals('hunter2', 'hunter2 ')).toBe(false);
-  expect(await secretEquals('', '')).toBe(true);
   expect(await secretEquals('short', 'a-much-longer-secret')).toBe(false);
 });

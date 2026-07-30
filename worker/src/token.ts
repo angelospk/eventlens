@@ -102,8 +102,18 @@ export async function verifyToken(
 /**
  * Compares two secrets without leaking their contents through timing. Length is compared
  * first and unavoidably leaks, which is why both sides are hashed to a fixed size first.
+ *
+ * An absent or empty secret never matches anything. That case is not theoretical: an
+ * unset binding arrives as `undefined`, `TextEncoder` turns that into the empty string,
+ * and a request carrying an empty header would otherwise hash to the same value and be
+ * accepted. Failing closed here means a missing secret locks the door instead of opening
+ * it to everyone.
  */
-export async function secretEquals(a: string, b: string): Promise<boolean> {
+export async function secretEquals(
+  a: string | undefined | null,
+  b: string | undefined | null
+): Promise<boolean> {
+  if (!a || !b) return false;
   const [ha, hb] = await Promise.all([
     crypto.subtle.digest('SHA-256', ENC.encode(a)),
     crypto.subtle.digest('SHA-256', ENC.encode(b))
