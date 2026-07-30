@@ -3,7 +3,7 @@
   import { v4 as uuid } from 'uuid';
   import { base } from '$app/paths';
   import { config } from '$lib/config';
-  import { today } from '$lib/date';
+  import { today, formatNight } from '$lib/date';
   import { IdbStore } from '$lib/idb-store';
   import { UploadQueue } from '$lib/upload-queue';
   import { makeR2Uploader, type Stage } from '$lib/r2-client';
@@ -293,7 +293,9 @@
         <img src="{base}/icons/icon-192.png" alt="" />
         <div>
           <h1>Ανέβασμα</h1>
-          <p class="hint" style="font-size:.78rem">{eventDate}</p>
+          <!-- Named rather than numeric: after midnight the photographer needs to see at a
+               glance that the shots are still filed under the night that is still going. -->
+          <p class="hint" style="font-size:.78rem">Βραδιά {formatNight(eventDate)}</p>
         </div>
       </div>
       <span class="chip {connection.cls}">{connection.text}</span>

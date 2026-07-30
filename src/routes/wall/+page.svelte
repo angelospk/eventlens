@@ -84,8 +84,9 @@
   }
 
   async function refresh() {
-    // A wall left running overnight should follow the calendar, otherwise it keeps showing
-    // yesterday's event after midnight. An explicit ?date= stays pinned.
+    // A wall left running overnight follows the same night boundary as the uploads, so it
+    // keeps showing tonight's photographs through the small hours and only turns over once
+    // the night is genuinely finished. An explicit ?date= stays pinned.
     if (!pinnedDate) {
       const now = today();
       if (now !== date) {
