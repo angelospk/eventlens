@@ -5,12 +5,12 @@
   import { today } from '$lib/date';
   import {
     fetchList,
-    downloadPhoto,
     moderatePhoto,
     moderateAll,
     deletePhoto,
     saveEvent
   } from '$lib/manager-client';
+  import { downloadOne, exportPhotos, type ExportProgress } from '$lib/export-photos';
   import { Session } from '$lib/session';
   import type { EventSettings, Moderation, PhotoListItem } from '$lib/types';
 
@@ -38,6 +38,106 @@
   });
 
   const shown = $derived(filter === 'all' ? photos : photos.filter((p) => p.moderation === filter));
+
+  // --- Picking several photos at once, to post them somewhere else -----------------
+  // Selection is entered by long-pressing a photo (the gesture every phone gallery
+  // uses) or by the toolbar button, which is the only route on a desktop.
+  let selectMode = $state(false);
+  let selected = $state<Record<string, true>>({});
+  let exporting = $state<ExportProgress | null>(null);
+
+  const selectedItems = $derived(shown.filter((p) => selected[p.id]));
+  const selectedCount = $derived(selectedItems.length);
+  const allShownSelected = $derived(shown.length > 0 && selectedCount === shown.length);
+
+  function exitSelect() {
+    selectMode = false;
+    selected = {};
+  }
+
+  function toggle(id: string) {
+    const next = { ...selected };
+    if (next[id]) delete next[id];
+    else next[id] = true;
+    selected = next;
+  }
+
+  // Long-press. The tile is already a button that opens the lightbox, so the click
+  // that follows the press has to be swallowed — otherwise entering selection mode
+  // also opens the photo.
+  let pressTimer: ReturnType<typeof setTimeout> | null = null;
+  let pressFired = false;
+
+  function pressStart(p: PhotoListItem) {
+    if (selectMode) return;
+    pressFired = false;
+    pressTimer = setTimeout(() => {
+      pressFired = true;
+      selectMode = true;
+      selected = { ...selected, [p.id]: true };
+      navigator.vibrate?.(15); // the same confirmation a native gallery gives
+    }, 450);
+  }
+
+  function pressCancel() {
+    if (pressTimer) clearTimeout(pressTimer);
+    pressTimer = null;
+  }
+
+  function tileClick(e: MouseEvent, p: PhotoListItem) {
+    pressCancel();
+    if (pressFired) {
+      pressFired = false;
+      e.preventDefault();
+      e.stopPropagation();
+      return;
+    }
+    if (selectMode) toggle(p.id);
+    else lightbox = p;
+  }
+
+  async function exportSelected() {
+    const items = selectedItems;
+    if (!items.length || exporting) return;
+    error = '';
+    exporting = { done: 0, total: items.length, phase: 'fetching' };
+    try {
+      const res = await exportPhotos(items, date, (p) => (exporting = p));
+      // count 0 means the share sheet was dismissed — leave the selection alone so
+      // the manager can just tap again.
+      if (res.count > 0) exitSelect();
+    } catch {
+      error = 'Η λήψη απέτυχε. Δοκίμασε ξανά.';
+    } finally {
+      exporting = null;
+    }
+  }
+
+  /** Same moderation action across the selection, one call per photo. */
+  async function moderateSelected(action: 'approve' | 'hide') {
+    const items = selectedItems;
+    if (!items.length) return;
+    for (const p of items) await setModeration(p, action);
+    exitSelect();
+  }
+
+  async function removeSelected() {
+    const items = selectedItems;
+    if (!items.length) return;
+    if (!confirm(`Οριστική διαγραφή ${items.length} φωτογραφιών;`)) return;
+    for (const p of items) {
+      busy = { ...busy, [p.id]: true };
+      try {
+        await deletePhoto(deps, p.id);
+        photos = photos.filter((x) => x.id !== p.id);
+      } catch {
+        error = 'Κάποιες φωτογραφίες δεν διαγράφηκαν.';
+      } finally {
+        busy = { ...busy, [p.id]: false };
+      }
+    }
+    exitSelect();
+  }
 
   const liveUrl = $derived(
     typeof location === 'undefined' ? '' : `${location.origin}${base}/live?date=${date}`
@@ -252,12 +352,53 @@
       <button class="tab" class:active={filter === 'hidden'} onclick={() => (filter = 'hidden')}>
         Κρυφές <span class="num">{counts.hidden}</span>
       </button>
+      <span style="margin-left:auto"></span>
+      {#if shown.length > 0 && !selectMode}
+        <button class="btn btn-sm" onclick={() => (selectMode = true)}>Επιλογή</button>
+      {/if}
       {#if counts.pending > 0}
-        <button class="btn btn-sm btn-primary" style="margin-left:auto" onclick={approveEverything}>
-          Έγκριση όλων
-        </button>
+        <button class="btn btn-sm btn-primary" onclick={approveEverything}>Έγκριση όλων</button>
       {/if}
     </div>
+
+    {#if selectMode}
+      <div class="selbar">
+        <strong>{selectedCount} επιλεγμένες</strong>
+        <button
+          class="btn btn-sm"
+          onclick={() =>
+            (selected = allShownSelected ? {} : Object.fromEntries(shown.map((p) => [p.id, true])))}
+        >
+          {allShownSelected ? 'Καμία' : `Όλες (${shown.length})`}
+        </button>
+        <span class="sel-spacer"></span>
+        <button
+          class="btn btn-sm btn-primary"
+          disabled={selectedCount === 0 || !!exporting}
+          onclick={exportSelected}
+        >
+          {#if exporting}
+            {exporting.phase === 'fetching'
+              ? `Λήψη ${exporting.done + 1}/${exporting.total}…`
+              : exporting.phase === 'packing'
+                ? 'Συμπίεση…'
+                : 'Άνοιγμα…'}
+          {:else}
+            Λήψη
+          {/if}
+        </button>
+        <button class="btn btn-sm" disabled={selectedCount === 0} onclick={() => moderateSelected('approve')}>
+          Έγκριση
+        </button>
+        <button class="btn btn-sm" disabled={selectedCount === 0} onclick={() => moderateSelected('hide')}>
+          Απόκρυψη
+        </button>
+        <button class="btn btn-sm btn-danger" disabled={selectedCount === 0} onclick={removeSelected}>
+          Διαγραφή
+        </button>
+        <button class="btn btn-sm" onclick={exitSelect}>Άκυρο</button>
+      </div>
+    {/if}
 
     {#if loading}
       <div class="grid">
@@ -274,13 +415,28 @@
       <div class="grid">
         {#each shown as p (p.id)}
           {@const c = chipFor(p.moderation)}
-          <figure class="tile" class:dim={p.moderation !== 'approved'}>
-            <button class="tile-img" onclick={() => (lightbox = p)} aria-label="Άνοιγμα φωτογραφίας">
+          <figure class="tile" class:dim={p.moderation !== 'approved'} class:picked={selected[p.id]}>
+            <button
+              class="tile-img"
+              onclick={(e) => tileClick(e, p)}
+              onpointerdown={() => pressStart(p)}
+              onpointerup={pressCancel}
+              onpointerleave={pressCancel}
+              onpointercancel={pressCancel}
+              oncontextmenu={(e) => selectMode && e.preventDefault()}
+              aria-pressed={selectMode ? !!selected[p.id] : undefined}
+              aria-label={selectMode
+                ? `${selected[p.id] ? 'Αποεπιλογή' : 'Επιλογή'} φωτογραφίας`
+                : 'Άνοιγμα φωτογραφίας'}
+            >
               <img src={p.public_url} alt={p.original_name ?? ''} loading="lazy" />
+              {#if selectMode}
+                <span class="tick" aria-hidden="true">{selected[p.id] ? '✓' : ''}</span>
+              {/if}
             </button>
             <figcaption>
               <span class="chip {c.cls}">{c.text}</span>
-              <div class="tile-actions">
+              <div class="tile-actions" class:hidden={selectMode}>
                 {#if p.moderation !== 'approved'}
                   <button class="btn btn-sm btn-primary" disabled={busy[p.id]}
                           onclick={() => setModeration(p, 'approve')}>Έγκριση</button>
@@ -288,7 +444,7 @@
                   <button class="btn btn-sm" disabled={busy[p.id]}
                           onclick={() => setModeration(p, 'hide')}>Απόκρυψη</button>
                 {/if}
-                <button class="btn btn-sm" onclick={() => downloadPhoto(p)}>Λήψη</button>
+                <button class="btn btn-sm" onclick={() => downloadOne(p)}>Λήψη</button>
                 <button class="btn btn-sm btn-danger" disabled={busy[p.id]}
                         onclick={() => remove(p)}>Διαγραφή</button>
               </div>
@@ -299,6 +455,12 @@
     {/if}
   {/if}
 </div>
+
+<svelte:window
+  onkeydown={(e) => {
+    if (e.key === 'Escape' && selectMode && !lightbox) exitSelect();
+  }}
+/>
 
 {#if lightbox}
   <div
@@ -450,13 +612,69 @@
     opacity: 0.45;
   }
 
+  .tile.picked {
+    border-color: var(--accent);
+    box-shadow: 0 0 0 2px var(--accent) inset;
+  }
+
   .tile-img {
     display: block;
+    position: relative;
     width: 100%;
     padding: 0;
     border: none;
     background: var(--surface-2);
     cursor: zoom-in;
+    /* A long press must not raise iOS's text-selection or callout UI on top of it. */
+    -webkit-touch-callout: none;
+    user-select: none;
+    -webkit-user-select: none;
+  }
+
+  .tile.picked .tile-img img {
+    opacity: 0.75;
+  }
+
+  .tick {
+    position: absolute;
+    top: 0.45rem;
+    right: 0.45rem;
+    width: 1.6rem;
+    height: 1.6rem;
+    display: grid;
+    place-items: center;
+    border-radius: 50%;
+    border: 2px solid #fff;
+    background: rgba(0, 0, 0, 0.45);
+    color: #fff;
+    font-size: 0.95rem;
+    line-height: 1;
+    /* Readable over both a bright sky and a dark dance floor. */
+    box-shadow: 0 1px 4px rgba(0, 0, 0, 0.5);
+  }
+
+  .tile.picked .tick {
+    background: var(--accent);
+    border-color: #fff;
+  }
+
+  .selbar {
+    position: sticky;
+    top: 0;
+    z-index: 5;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.4rem;
+    margin-bottom: 1rem;
+    padding: 0.6rem;
+    background: var(--surface-2);
+    border: 1px solid var(--accent);
+    border-radius: var(--r-card);
+  }
+
+  .sel-spacer {
+    margin-left: auto;
   }
 
   .tile-img img {
@@ -479,6 +697,12 @@
     display: flex;
     flex-wrap: wrap;
     gap: 0.3rem;
+  }
+
+  /* In selection mode the per-tile buttons are noise — and on a phone they are big
+     enough to be tapped by accident while picking photos. */
+  .tile-actions.hidden {
+    display: none;
   }
 
   .lightbox {

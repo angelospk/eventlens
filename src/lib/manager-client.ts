@@ -86,22 +86,3 @@ export async function saveEvent(
   });
   if (!res.ok) throw new Error(`event save failed ${res.status}`);
 }
-
-// Browser-only: fetch the public object as a blob and trigger a download with the original
-// base name, keeping whatever extension the stored file actually has. Not unit-tested
-// (needs DOM); manual smoke.
-export async function downloadPhoto(item: PhotoListItem): Promise<void> {
-  const res = await fetch(item.public_url);
-  if (!res.ok) throw new Error(`download failed ${res.status}`);
-  const blob = await res.blob();
-  const objUrl = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = objUrl;
-  const base = (item.original_name || item.id).replace(/\.[^./]+$/, '');
-  const ext = item.public_url.match(/\.(webp|jpg|avif)(?:\?|$)/)?.[1] ?? 'webp';
-  a.download = `${base}.${ext}`;
-  document.body.appendChild(a);
-  a.click();
-  a.remove();
-  URL.revokeObjectURL(objUrl);
-}
