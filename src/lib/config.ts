@@ -3,9 +3,10 @@ export const config = {
   workerUrl: import.meta.env?.VITE_WORKER_URL ?? 'http://localhost:8787',
   // logo path is resolved against the SvelteKit base path at call sites (see processor):
   logoFile: 'logo.png',
-  // Encoder quality, 0-100. Handed to the browser's own WebP encoder (JPEG where WebP is
-  // not available). The old WebAssembly AVIF encoder was replaced because it took roughly
-  // ninety seconds per photo on the hardware this runs on.
+  // Encoder quality, 0-100. Everything ends up as WebP: natively where the browser can,
+  // and through a WebAssembly encoder on Safari, which cannot encode WebP from a canvas
+  // and whose JPEG ran about five times larger per megapixel. The old AVIF encoder was
+  // dropped because it took roughly ninety seconds per photo; WebP is seconds.
   quality: 78,
   // Brand colour grade, applied as a pixel transform inside the worker. It used to be a
   // canvas `filter` string, which Safari does not support — the grade silently vanished

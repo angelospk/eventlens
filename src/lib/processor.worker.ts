@@ -32,27 +32,51 @@ export type ProcessResponse =
   | { id: string; ok: false; error: string };
 
 /**
- * Encodes with the browser's own encoder instead of a WebAssembly one.
+ * Encodes the finished frame, preferring the browser's own encoder.
  *
- * This replaced a wasm AVIF encoder. Measured on the same machine, same 2560x1920 frame:
- * native WebP took 0.5s and produced 125KB; the wasm AVIF took about ninety seconds and
- * produced 485KB. On a phone at an outdoor event that is the difference between a queue
- * that keeps up with the photographer and one that never does, and it costs no download
- * and almost no battery.
+ * Three paths, in order of what they cost:
  *
- * `convertToBlob` does NOT reject when it cannot encode the format asked for: it quietly
- * returns a PNG, which for a photograph is enormous. So the result is always checked, and
- * JPEG is the fallback for anything that cannot make WebP.
+ * 1. Native WebP. Measured on this machine, 2560x1920: 0.5s and 125KB. Free, no download.
+ * 2. WebAssembly WebP, for Safari, which cannot encode WebP from a canvas. Costs a one-off
+ *    module download and a few seconds of CPU per photo, and produces files roughly a fifth
+ *    the size of the JPEG it replaces. At an outdoor festival the upload is the bottleneck,
+ *    not the phone, so spending CPU to avoid megabytes is the right trade.
+ * 3. Native JPEG, when neither of the above is available.
+ *
+ * This replaced a wasm AVIF encoder that took about ninety seconds per photo. WebP is a
+ * different animal: the AVIF encoder was the slow one, not WebAssembly itself.
+ *
+ * `convertToBlob` does NOT reject when it cannot produce the format asked for: it quietly
+ * returns a PNG, which for a photograph is enormous. So the result is always checked.
  */
-async function encodeImage(canvas: OffscreenCanvas, quality: number, mime: string) {
+async function encodeImage(
+  canvas: OffscreenCanvas,
+  ctx: OffscreenCanvasRenderingContext2D,
+  quality: number,
+  mime: string,
+  width: number,
+  height: number
+) {
   const q = Math.min(0.95, Math.max(0.5, quality / 100));
   const blob = await canvas.convertToBlob({ type: mime, quality: q });
-  if (blob.type !== mime) {
-    // The upload was already signed for `mime`, so a silent PNG here would be rejected by
-    // storage. Better to fail the photo with a real reason than to send the wrong bytes.
-    throw new Error(`ο browser δεν παρήγαγε ${mime}`);
+  if (blob.type === mime) return blob;
+
+  if (mime === 'image/webp') {
+    // Safari lands here. The format was already signed as WebP precisely because the probe
+    // confirmed this path exists, so failing over to JPEG would send bytes that do not
+    // match the signature.
+    const { default: encodeWebp } = await import('@jsquash/webp/encode');
+    const buf = await encodeWebp(ctx.getImageData(0, 0, width, height), {
+      quality,
+      // Encoder effort, 0-6. Four is the point where more time stops buying much size.
+      method: 4
+    });
+    return new Blob([buf], { type: mime });
   }
-  return blob;
+
+  // The upload was already signed for `mime`, so a silent PNG here would be rejected by
+  // storage. Better to fail the photo with a real reason than to send the wrong bytes.
+  throw new Error(`ο browser δεν παρήγαγε ${mime}`);
 }
 
 let logoPromise: Promise<ImageBitmap> | null = null;
@@ -187,7 +211,7 @@ async function process(req: ProcessRequest): Promise<ProcessResponse> {
     ctx.drawImage(logo, x, y, lw, lh);
     ctx.restore();
 
-    const blob = await encodeImage(canvas, req.quality, req.mime);
+    const blob = await encodeImage(canvas, ctx, req.quality, req.mime, W, H);
     const buf = await blob.arrayBuffer();
     return { id: req.id, ok: true, buffer: buf, width: W, height: H, mime: req.mime };
   } catch (e) {
