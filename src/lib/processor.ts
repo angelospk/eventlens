@@ -9,6 +9,18 @@ import type { ProcessRequest, ProcessResponse } from './processor.worker';
 
 let worker: Worker | null = null;
 let seq = 0;
+
+/**
+ * How many photographs one worker handles before it is replaced.
+ *
+ * The WebAssembly encoder's heap grows to fit the largest frame it has seen and never
+ * gives that memory back. On a desktop nobody notices; on a phone, where the whole tab has
+ * a few hundred megabytes and each photograph is twenty of them, it is the difference
+ * between a night of uploads and the app dying after a handful. Replacing the worker
+ * hands the entire heap back to the operating system, and costs one module load.
+ */
+const PHOTOS_PER_WORKER = 8;
+let handled = 0;
 const pending = new Map<
   string,
   { resolve: (p: Processed) => void; reject: (e: unknown) => void }
@@ -25,6 +37,7 @@ function ensureWorker(): Worker {
     if (!entry) return;
     pending.delete(res.id);
     if (res.ok) {
+      handled++;
       const blob = new Blob([res.buffer], { type: res.mime });
       const thumb = res.thumb ? new Blob([res.thumb], { type: res.mime }) : undefined;
       entry.resolve({ blob, thumb, mime: res.mime, width: res.width, height: res.height, bytes: blob.size });
@@ -59,6 +72,12 @@ export function disposeProcessor() {
 }
 
 export async function processImage(file: Blob, mime: string): Promise<Processed> {
+  // Recycled between photographs, never during one: tearing down mid-encode would reject
+  // work that was about to succeed.
+  if (handled >= PHOTOS_PER_WORKER && pending.size === 0) {
+    teardown(new Error('processor recycled'));
+    handled = 0;
+  }
   const w = ensureWorker();
   const id = `p${++seq}`;
   // A Blob is not transferable, so read it once here and hand over the ArrayBuffer.

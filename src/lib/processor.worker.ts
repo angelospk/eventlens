@@ -193,11 +193,14 @@ async function process(req: ProcessRequest): Promise<ProcessResponse> {
 
     // Grade, pick the calmest corner from the graded pixels, then write them back — one
     // read/write pair instead of a separate pass per step.
-    const id = ctx.getImageData(0, 0, W, H);
+    let id: ImageData | null = ctx.getImageData(0, 0, W, H);
     grade(id.data, req.grade);
     const px: Pixels = { data: id.data, width: W, height: H };
     const corner = quietestCorner(px);
     ctx.putImageData(id, 0, 0);
+    // Twenty megabytes for a phone photograph, and nothing below needs it. Dropping the
+    // reference now lets it be collected before the encoder asks for its own copy.
+    id = null;
 
     const logo = await loadLogo(req.logoUrl);
     // Scaled against the image WIDTH, not the short edge. The mark is a wide wordmark, so
@@ -216,13 +219,14 @@ async function process(req: ProcessRequest): Promise<ProcessResponse> {
     ctx.drawImage(logo, x, y, lw, lh);
     ctx.restore();
 
-    const blob = await encodeImage(canvas, ctx, req.quality, req.mime, W, H);
-    const buf = await blob.arrayBuffer();
-
-    // A small copy for the gallery, drawn from the frame that already carries the grade
-    // and the logo so the two never disagree. Visitors were downloading full frames to
-    // look at two-hundred-pixel tiles; on a field on mobile data that is most of the
-    // page weight for none of the benefit.
+    // The gallery copy is taken FIRST, while memory is at its calmest.
+    //
+    // Order matters more than it looks on a phone. A full frame at this size is about
+    // twenty megabytes of pixels; encoding it allocates another copy for the encoder, and
+    // on Safari the WebAssembly encoder needs a third. Doing the small copy afterwards
+    // means asking for yet another canvas at the exact moment the process is already at
+    // its peak, and iOS answers that by killing the tab, which is what "it breaks after
+    // the second photograph" looks like from the outside.
     let thumbBuf: ArrayBuffer | undefined;
     if (req.thumbLongEdge > 0 && Math.max(W, H) > req.thumbLongEdge) {
       const ts = req.thumbLongEdge / Math.max(W, H);
@@ -239,7 +243,16 @@ async function process(req: ProcessRequest): Promise<ProcessResponse> {
           // A thumbnail is an optimisation, never a reason to lose the photograph.
         }
       }
+      // Hand the small canvas back to the collector rather than waiting for the next
+      // photograph to pressure it out.
+      tCanvas.width = tCanvas.height = 0;
     }
+
+    const blob = await encodeImage(canvas, ctx, req.quality, req.mime, W, H);
+    // Releasing the backing store here rather than at the end of the function means the
+    // twenty megabytes are gone before the ArrayBuffer copy below, not after it.
+    canvas.width = canvas.height = 0;
+    const buf = await blob.arrayBuffer();
 
     return { id: req.id, ok: true, buffer: buf, thumb: thumbBuf, width: W, height: H, mime: req.mime };
   } catch (e) {

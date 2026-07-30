@@ -29,6 +29,13 @@ async function cacheBestEffort(cache: Cache, urls: string[]) {
   await Promise.allSettled(urls.map((url) => cache.add(url)));
 }
 
+// The page asks for the swap when it judges the moment safe, rather than the worker
+// deciding for itself. Without this an installed app on a phone keeps running the old
+// code until it is force-quit, which during an event may simply never happen.
+sw.addEventListener('message', (event) => {
+  if ((event.data as { type?: string })?.type === 'skip-waiting') sw.skipWaiting();
+});
+
 sw.addEventListener('install', (event) => {
   event.waitUntil(
     (async () => {
@@ -39,10 +46,11 @@ sw.addEventListener('install', (event) => {
   );
 });
 
-// Deliberately no skipWaiting/clients.claim. A page that is already open keeps its own
-// worker and its own cache generation until it closes. Taking over immediately would let
-// activate() delete the caches that the running page still lazy-loads chunks from, so a
-// deploy during an event would break the photo processor in an app that looks fine.
+// Activation only happens once a page has explicitly asked for it, and that page reloads
+// the moment control changes. That ordering is what makes clearing the old caches here
+// safe: nothing is still running against them. A worker that took over on its own would
+// delete the caches an open page was still lazy-loading its chunks from, and break the
+// photo processor in an app that looked perfectly fine.
 sw.addEventListener('activate', (event) => {
   event.waitUntil(
     caches
@@ -52,6 +60,7 @@ sw.addEventListener('activate', (event) => {
           keys.filter((k) => k.startsWith(`${PREFIX}-`) && k !== CACHE).map((k) => caches.delete(k))
         )
       )
+      .then(() => sw.clients.claim())
   );
 });
 
