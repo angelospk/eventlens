@@ -16,7 +16,7 @@ test('signs first, PUTs blob, then POSTs /meta in order', async () => {
     }
     return new Response('{}', { status: 200 });
   });
-  const fakeProcess = async () => ({ avif: new Blob(['avif']), width: 10, height: 20, bytes: 4 });
+  const fakeProcess = async () => ({ blob: new Blob(['webp']), mime: 'image/webp', ext: 'webp', width: 10, height: 20, bytes: 4 });
 
   const uploader = makeR2Uploader({
     workerUrl: 'https://wkr',

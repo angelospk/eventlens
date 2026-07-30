@@ -26,7 +26,14 @@ export interface QueueItem {
   originalName: string;
   eventDate: string;     // YYYY-MM-DD
   status: ItemStatus;
+  // Failures that count against the retry limit. A dead network is not one of them: the
+  // photo is fine, the field is just full of people, so those never exhaust the ladder.
   attempts: number;
+  // Every attempt including the network ones, purely so the UI can say "try 6".
+  tries?: number;
+  // Identifies the underlying file so the same photograph is not sent twice. See
+  // `fingerprintOf` for why this is the file's identity rather than a hash of its bytes.
+  fingerprint?: string;
   // Epoch ms when the photo was picked. IndexedDB returns rows ordered by key, and the key
   // is a uuid, so without this the queue uploads in effectively random order and the wall
   // shows the night out of sequence.
@@ -40,7 +47,14 @@ export interface QueueItem {
   bytes?: number;
 }
 
-export interface Processed { avif: Blob; width: number; height: number; bytes: number; }
+export interface Processed {
+  blob: Blob;
+  /** The format the upload was signed for: WebP everywhere it can, JPEG if not. */
+  mime: string;
+  width: number;
+  height: number;
+  bytes: number;
+}
 
 // Sent to /meta. The server already knows r2_key/public_url from /sign;
 // the client only confirms the upload + reports dimensions.

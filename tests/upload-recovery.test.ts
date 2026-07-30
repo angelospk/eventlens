@@ -1,6 +1,6 @@
 import { test, expect } from 'bun:test';
 import { UploadQueue } from '../src/lib/upload-queue';
-import { AlreadyUploadedError, NonRetryableError, classifyStatus } from '../src/lib/errors';
+import { AlreadyUploadedError, NetworkError, NonRetryableError, classifyStatus, describeError } from '../src/lib/errors';
 import { makeR2Uploader } from '../src/lib/r2-client';
 import type { QueueItem } from '../src/lib/types';
 
@@ -191,7 +191,7 @@ test('uploader turns a 409 from /sign into AlreadyUploaded and skips processing'
     auth: async () => ({ authorization: 'Bearer tok' }),
     process: async () => {
       processed = true;
-      return { avif: new Blob(['a']), width: 1, height: 1, bytes: 1 };
+      return { blob: new Blob(['a']), mime: 'image/webp', ext: 'webp', width: 1, height: 1, bytes: 1 };
     },
     fetchImpl: (async (url: string) => {
       if (String(url).endsWith('/sign')) {
@@ -209,9 +209,115 @@ test('uploader turns a 401 from /sign into a non-retryable error', async () => {
   const uploader = makeR2Uploader({
     workerUrl: 'https://wkr',
     auth: async () => ({ authorization: 'Bearer tok' }),
-    process: async () => ({ avif: new Blob(['a']), width: 1, height: 1, bytes: 1 }),
+    process: async () => ({ blob: new Blob(['a']), mime: 'image/webp', ext: 'webp', width: 1, height: 1, bytes: 1 }),
     fetchImpl: (async () => new Response('{"error":"unauthorized"}', { status: 401 })) as any
   });
 
   await expect(uploader.run(item('g'))).rejects.toBeInstanceOf(NonRetryableError);
+});
+
+/** A dead network now retries forever, so tests watch the store instead of awaiting drain. */
+async function until(check: () => Promise<boolean>, ms = 2000) {
+  const deadline = Date.now() + ms;
+  while (Date.now() < deadline) {
+    if (await check()) return true;
+    await new Promise((r) => setTimeout(r, 5));
+  }
+  return false;
+}
+
+test('the photographer is told a network failure in plain language, not a stack trace', async () => {
+  const store = new MemStore();
+  const uploader = { async run() { throw new NetworkError('/sign'); } };
+  const q = new UploadQueue(store, uploader, { baseMs: 1, maxMs: 2, maxAttempts: 2 });
+  await q.enqueue(item('n1'));
+  void q.drain();
+  await until(async () => Boolean((await store.all())[0]?.lastError));
+  q.stop();
+
+  const [stored] = await store.all();
+  expect(stored.lastError).toBe('Δεν έφυγε — χωρίς σύνδεση. Θα ξαναδοκιμάσει μόνο του.');
+  expect(stored.lastError).not.toContain('fetch');
+});
+
+test('a dead network never marks a photo as failed, however long it lasts', async () => {
+  const store = new MemStore();
+  const q = new UploadQueue(
+    store,
+    { async run() { throw new NetworkError('/sign'); } },
+    { baseMs: 1, maxMs: 2, maxAttempts: 3 }
+  );
+  await q.enqueue(item('n5'));
+  void q.drain();
+  // Far more attempts than maxAttempts: the photo must still be waiting, not given up on.
+  await until(async () => ((await store.all())[0]?.tries ?? 0) > 8);
+  q.stop();
+
+  const [stored] = await store.all();
+  expect(stored.tries).toBeGreaterThan(8);
+  expect(stored.attempts).toBe(0); // no network failure counted against the limit
+  expect(stored.status).not.toBe('error');
+});
+
+test('resume cuts short the backoff instead of waiting it out', async () => {
+  const store = new MemStore();
+  let fail = true;
+  const q = new UploadQueue(
+    store,
+    { async run() { if (fail) throw new NetworkError('/sign'); } },
+    { baseMs: 60_000, maxMs: 60_000, maxAttempts: 5 } // a minute of backoff after one failure
+  );
+  await q.enqueue(item('n6'));
+  void q.drain();
+  await until(async () => Boolean((await store.all())[0]?.nextAttemptAt));
+
+  fail = false;
+  const t0 = Date.now();
+  await q.resume();
+
+  expect(await store.all()).toEqual([]); // uploaded
+  expect(Date.now() - t0).toBeLessThan(2000); // not the 60s the backoff asked for
+});
+
+test('repeated network failures raise the "weak signal" flag, other failures do not', async () => {
+  const store = new MemStore();
+  const q = new UploadQueue(
+    store,
+    { async run() { throw new NetworkError('/sign'); } },
+    { baseMs: 1, maxMs: 2, maxAttempts: 4 }
+  );
+  await q.enqueue(item('n2'));
+  void q.drain();
+  await until(async () => q.struggling);
+  q.stop();
+  expect(q.struggling).toBe(true);
+
+  const store2 = new MemStore();
+  const q2 = new UploadQueue(
+    store2,
+    { async run() { throw new NonRetryableError('nope', 'bad_request'); } },
+    { baseMs: 1, maxMs: 2, maxAttempts: 4 }
+  );
+  await q2.enqueue(item('n3'));
+  await q2.drain();
+  expect(q2.struggling).toBe(false); // a rejected file is not a connection problem
+});
+
+test('a success clears the weak-signal flag', async () => {
+  const store = new MemStore();
+  let fail = true;
+  const q = new UploadQueue(
+    store,
+    { async run() { if (fail) throw new NetworkError('/sign'); } },
+    { baseMs: 1, maxMs: 2, maxAttempts: 9 }
+  );
+  await q.enqueue(item('n4'));
+  void q.drain();
+  await until(async () => q.struggling);
+  q.stop();
+  expect(q.struggling).toBe(true);
+
+  fail = false;
+  await q.retryAll();
+  expect(q.struggling).toBe(false);
 });

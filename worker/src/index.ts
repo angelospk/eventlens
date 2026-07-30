@@ -21,6 +21,13 @@ interface Env {
 const PUBLIC_CACHE = 'public, max-age=5, s-maxage=15, stale-while-revalidate=60';
 
 const ID_RE = /^[\w-]{8,}$/;
+// What the browser's own encoder can produce, plus avif for photographs uploaded before
+// the switch away from the WebAssembly encoder.
+const EXT_TYPES: Record<string, string> = {
+  webp: 'image/webp',
+  jpg: 'image/jpeg',
+  avif: 'image/avif'
+};
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 const MAX_BODY = 4096;
 
@@ -154,12 +161,21 @@ export default {
     // public_url) and returns a signed PUT URL.
     if (url.pathname === '/sign' && req.method === 'POST') {
       if (!isPhotographer) return unauthorized(env);
-      const body = await readJson<{ id: string; eventDate: string; originalName?: string }>(req);
+      const body = await readJson<{
+        id: string;
+        eventDate: string;
+        originalName?: string;
+        ext?: string;
+      }>(req);
       if (!body) return badInput(env);
       const { id, eventDate, originalName } = body;
       if (!ID_RE.test(id) || !validDate(eventDate)) return badInput(env);
+      // Older clients do not send it; they were all producing AVIF.
+      const ext = body.ext ?? 'avif';
+      const contentType = EXT_TYPES[ext];
+      if (!contentType) return badInput(env);
 
-      const key = `events/${eventDate}/${id}.avif`;
+      const key = `events/${eventDate}/${id}.${ext}`;
       const publicUrl = `${env.PUBLIC_BASE}/${key}`;
 
       const insertRes = await env.DB.prepare(
@@ -190,7 +206,7 @@ export default {
       const signed = await client.sign(
         new Request(`${target}?X-Amz-Expires=3600`, {
           method: 'PUT',
-          headers: { 'content-type': 'image/avif' }
+          headers: { 'content-type': contentType }
         }),
         { aws: { signQuery: true } }
       );
@@ -247,7 +263,8 @@ export default {
     // and a warm edge answers without touching R2 at all.
     if (url.pathname.startsWith('/img/') && req.method === 'GET') {
       const key = decodeURIComponent(url.pathname.slice('/img/'.length));
-      if (!/^events\/\d{4}-\d{2}-\d{2}\/[\w-]{8,}\.avif$/.test(key)) return badInput(env);
+      const match = /^events\/\d{4}-\d{2}-\d{2}\/[\w-]{8,}\.(webp|jpg|avif)$/.exec(key);
+      if (!match) return badInput(env);
 
       const cache = caches.default;
       const cacheKey = new Request(`${url.origin}/img/${key}`, { method: 'GET' });
@@ -259,7 +276,7 @@ export default {
 
       const res = new Response(obj.body, {
         headers: {
-          'content-type': 'image/avif',
+          'content-type': EXT_TYPES[match[1]],
           'cache-control': 'public, max-age=31536000, immutable',
           etag: obj.httpEtag,
           // Images are loaded as <img>, not fetched, but a permissive header keeps

@@ -25,8 +25,8 @@ function ensureWorker(): Worker {
     if (!entry) return;
     pending.delete(res.id);
     if (res.ok) {
-      const avif = new Blob([res.buffer], { type: 'image/avif' });
-      entry.resolve({ avif, width: res.width, height: res.height, bytes: avif.size });
+      const blob = new Blob([res.buffer], { type: res.mime });
+      entry.resolve({ blob, mime: res.mime, width: res.width, height: res.height, bytes: blob.size });
     } else {
       // A processing failure is deterministic: the same file will fail the same way on
       // every retry, so it must not ride the network backoff ladder.
@@ -57,7 +57,7 @@ export function disposeProcessor() {
   teardown(new Error('processor disposed'));
 }
 
-export async function processImage(file: Blob): Promise<Processed> {
+export async function processImage(file: Blob, mime: string): Promise<Processed> {
   const w = ensureWorker();
   const id = `p${++seq}`;
   // A Blob is not transferable, so read it once here and hand over the ArrayBuffer.
@@ -69,8 +69,8 @@ export async function processImage(file: Blob): Promise<Processed> {
     type: file.type || 'image/jpeg',
     logoUrl: new URL(`${base}/${config.logoFile}`, location.href).href,
     maxLongEdge: config.maxLongEdge,
-    quality: config.avif.quality,
-    speed: config.avif.effort,
+    quality: config.quality,
+    mime,
     logoWidthFraction: config.logoWidthFraction,
     logoPaddingFraction: config.logoPaddingFraction,
     grade: config.grade

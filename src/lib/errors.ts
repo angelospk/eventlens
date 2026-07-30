@@ -24,8 +24,48 @@ export class AlreadyUploadedError extends Error {
   }
 }
 
+/**
+ * The request never reached the server: no signal, a captive portal, a dead hotspot. Kept
+ * separate from a server error because the advice to the photographer is different, and
+ * because it is the normal case at an outdoor festival rather than an exception.
+ */
+export class NetworkError extends Error {
+  readonly code = 'network';
+  constructor(where: string) {
+    super(`network unreachable (${where})`);
+    this.name = 'NetworkError';
+  }
+}
+
+export const isNetworkError = (e: unknown): e is NetworkError => e instanceof NetworkError;
+
 export const isNonRetryable = (e: unknown): e is NonRetryableError =>
   e instanceof NonRetryableError;
+
+/**
+ * A sentence the photographer can act on, instead of the raw failure. They are standing in
+ * a field at night; "put failed 500" tells them nothing about whether to wait, retry, or
+ * find the person with the passcode.
+ */
+export function describeError(e: unknown): string {
+  if (isNetworkError(e)) return 'Δεν έφυγε — χωρίς σύνδεση. Θα ξαναδοκιμάσει μόνο του.';
+  if (isNonRetryable(e)) {
+    switch (e.code) {
+      case 'unauthorized':
+        return 'Ο κωδικός δεν ισχύει πια. Κάνε έξοδο και ξαναμπές.';
+      case 'process_failed':
+        return 'Η φωτογραφία δεν διαβάστηκε. Δοκίμασε άλλη μορφή αρχείου.';
+      default:
+        return 'Ο διακομιστής απέρριψε τη φωτογραφία.';
+    }
+  }
+  const text = e instanceof Error ? e.message : String(e);
+  // Anything the browser throws from fetch lands here as a TypeError with a vague message.
+  if (/fetch|network|load failed/i.test(text)) {
+    return 'Δεν έφυγε — χωρίς σύνδεση. Θα ξαναδοκιμάσει μόνο του.';
+  }
+  return 'Κάτι πήγε στραβά στην αποστολή. Θα ξαναδοκιμάσει μόνο του.';
+}
 
 export const isAlreadyUploaded = (e: unknown): e is AlreadyUploadedError =>
   e instanceof AlreadyUploadedError;

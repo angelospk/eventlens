@@ -9,9 +9,17 @@ const sw = self as unknown as ServiceWorkerGlobalScope;
 const PREFIX = 'eventlens';
 const CACHE = `${PREFIX}-${version}`;
 
+// A safety net for the HEIC decoder: three megabytes of WebAssembly that only iPhone-native
+// files need. SvelteKit does not currently list worker output in `build`, so it is already
+// outside the precache and gets stored by the runtime handler the first time it is used.
+// This keeps that true if a future version starts listing worker chunks, because precaching
+// it would make every install pay for a decoder most nights never touch, on exactly the
+// sort of connection where three megabytes decides whether the app is ready at all.
+const isOnDemand = (url: string) => url.includes('heic-decoder') || url.includes('/workers/chunks/');
+
 // Hashed build output plus everything in static/. These are real files at real URLs, so a
 // failure here means something is genuinely broken and the install should fail loudly.
-const CORE = [...build, ...files];
+const CORE = [...build, ...files].filter((url) => !isOnDemand(url));
 
 // Prerendered routes are best-effort. They are extensionless URLs ("/live") that depend on
 // the host rewriting to "live.html"; GitHub Pages does, other static hosts may not. One
@@ -66,7 +74,19 @@ sw.addEventListener('fetch', (event) => {
 
   if (isImmutable(url)) {
     event.respondWith(
-      caches.match(req).then((hit) => hit ?? fetch(req))
+      (async () => {
+        const hit = await caches.match(req);
+        if (hit) return hit;
+        // Not precached, which today means the on-demand HEIC decoder. Store it on the way
+        // through: it is content-hashed and therefore never stale, and a photographer who
+        // shoots HEIC must not re-download three megabytes for every single photo.
+        const res = await fetch(req);
+        if (res.ok) {
+          const cache = await caches.open(CACHE);
+          event.waitUntil(cache.put(req, res.clone()));
+        }
+        return res;
+      })()
     );
     return;
   }

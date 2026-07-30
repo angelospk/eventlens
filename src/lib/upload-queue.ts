@@ -1,11 +1,18 @@
 import type { QueueItem } from './types';
-import { isAlreadyUploaded, isNonRetryable } from './errors';
+import { describeError, isAlreadyUploaded, isNetworkError, isNonRetryable } from './errors';
 
 export interface QueueStore {
   add(item: QueueItem): Promise<void>;
   update(id: string, patch: Partial<QueueItem>): Promise<void>;
   remove(id: string): Promise<void>;
   all(): Promise<QueueItem[]>;
+  /**
+   * Remembers which files already reached the server, so a photograph picked a second time
+   * is recognised even after its queue row is long gone. Optional: the in-memory store used
+   * by the tests, and any future store, can leave duplicate detection to the queue alone.
+   */
+  markSent?(fingerprint: string): Promise<void>;
+  wasSent?(fingerprint: string): Promise<boolean>;
 }
 
 export interface Uploader {
@@ -27,6 +34,14 @@ export class UploadQueue {
   private running = false;
   private dirty = false;
   private active: Promise<void> | null = null;
+  // Consecutive failures caused by the network rather than by the server or the file.
+  // `navigator.onLine` cannot see a hotspot that answers DHCP and nothing else, which is
+  // the normal state of a field full of people, so the truth comes from real attempts.
+  private netFails = 0;
+  // Set while the drain loop is waiting out a backoff, so the wait can be cut short the
+  // moment the device reports a connection again.
+  private wake: (() => void) | null = null;
+  private stopped = false;
   private _completed = 0;
   constructor(
     private store: QueueStore,
@@ -38,14 +53,36 @@ export class UploadQueue {
   /** Number of items successfully uploaded this session (they are removed from the store). */
   get completed() { return this._completed; }
 
-  async enqueue(item: QueueItem) {
+  /**
+   * True once the network has failed us repeatedly. One failure is noise; two in a row
+   * means the photographer should be told the connection is the problem, not their photos.
+   */
+  get struggling() { return this.netFails >= 2; }
+
+  /**
+   * Adds a photograph unless it is already here or already sent.
+   *
+   * Re-picking files is the normal way this goes wrong at an event: the photographer opens
+   * the picker, cannot remember which ones went last time, and selects the lot. Without
+   * this the same photograph goes up twice and appears twice on the wall.
+   */
+  async enqueue(item: QueueItem): Promise<'queued' | 'duplicate'> {
+    if (item.fingerprint) {
+      const queued = await this.store.all();
+      if (queued.some((i) => i.fingerprint === item.fingerprint && i.status !== 'done')) {
+        return 'duplicate';
+      }
+      if (await this.store.wasSent?.(item.fingerprint)) return 'duplicate';
+    }
     await this.store.add(item);
     this.onChange();
+    return 'queued';
   }
 
   private static readonly RESET: Partial<QueueItem> = {
     status: 'pending',
     attempts: 0,
+    tries: 0,
     lastError: undefined,
     nextAttemptAt: undefined
   };
@@ -87,6 +124,7 @@ export class UploadQueue {
    * than the instant it was requested.
    */
   drain(): Promise<void> {
+    this.stopped = false;
     if (this.running) {
       this.dirty = true;
       return this.active ?? Promise.resolve();
@@ -107,6 +145,7 @@ export class UploadQueue {
           // pick the same unwritable item forever and spin the CPU.
           const skip = new Set<string>();
           for (;;) {
+            if (this.stopped) return;
             const items = (await this.store.all())
               .filter((i) => isRunnable(i, this.retry.maxAttempts) && !skip.has(i.id))
               // Oldest first, so the night uploads in the order it was shot.
@@ -122,9 +161,9 @@ export class UploadQueue {
             // All runnable items are still in backoff: wait until the soonest, then loop.
             // (A newly-enqueued item has no nextAttemptAt, so it would have been 'ready'.)
             const soonest = Math.min(...items.map((i) => i.nextAttemptAt as number));
-            await sleep(Math.max(0, soonest - now));
+            await this.waitUntil(Math.max(0, soonest - now));
           }
-        } while (this.dirty); // an enqueue happened mid-drain → another pass
+        } while (this.dirty && !this.stopped); // an enqueue happened mid-drain → another pass
       } finally {
         this.running = false;
         this.onChange();
@@ -138,33 +177,89 @@ export class UploadQueue {
    * that anything is wrong. Returns false when the store could not be written, so the
    * caller can stop retrying that item this pass.
    */
+  /** A backoff wait that `resume()` can interrupt. */
+  private waitUntil(ms: number): Promise<void> {
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        this.wake = null;
+        resolve();
+      }, ms);
+      this.wake = () => {
+        clearTimeout(timer);
+        this.wake = null;
+        resolve();
+      };
+    });
+  }
+
+  /**
+   * The device says it has a connection again. Everything sitting in backoff should go now
+   * rather than serve out a wait that was based on the network being down: at an event the
+   * signal returns in bursts, and a photographer should not watch a full queue do nothing
+   * for half a minute after the bars come back.
+   */
+  /**
+   * Ends the drain loop. Needed because a network failure no longer exhausts the retry
+   * ladder, so without this the queue would keep trying with credentials the user has
+   * just signed out of, forever.
+   */
+  stop() {
+    this.stopped = true;
+    this.wake?.();
+  }
+
+  async resume() {
+    this.stopped = false;
+    const items = await this.store.all();
+    for (const i of items) {
+      if (i.status !== 'error' && i.nextAttemptAt) {
+        await this.store.update(i.id, { nextAttemptAt: undefined });
+      }
+    }
+    this.netFails = 0;
+    this.wake?.();
+    this.onChange();
+    return this.drain();
+  }
+
   private async process(it: QueueItem): Promise<boolean> {
-    const attempts = it.attempts + 1;
+    const tries = (it.tries ?? 0) + 1;
     try {
-      await this.store.update(it.id, { status: 'uploading', attempts });
+      await this.store.update(it.id, { status: 'uploading', tries });
     } catch {
       return false; // storage is unavailable (tab closing, quota); leave it for next open
     }
     this.onChange();
     try {
       await this.uploader.run(it);
-      await this.finish(it.id);
+      this.netFails = 0;
+      await this.finish(it.id, it.fingerprint);
       return true;
     } catch (e) {
       // The server already has it: count it as done rather than scaring the photographer
       // with a failure for a photo that is actually up.
       if (isAlreadyUploaded(e)) {
-        await this.finish(it.id);
+        this.netFails = 0;
+        await this.finish(it.id, it.fingerprint);
         return true;
       }
+      const networky = isNetworkError(e);
+      this.netFails = networky ? this.netFails + 1 : 0;
+      // A failure to reach the server says nothing about the photo, so it must not consume
+      // the retry budget. Otherwise a long outage marks a whole night as failed and the
+      // photographer has to notice and press retry on every one.
+      const attempts = networky ? it.attempts : it.attempts + 1;
       // A wrong passcode or a broken file fails the same way forever - go straight to
       // 'error' instead of spending the whole backoff ladder rediscovering that.
       const terminal = isNonRetryable(e) || attempts >= this.retry.maxAttempts;
-      const backoff = Math.min(this.retry.maxMs, this.retry.baseMs * 2 ** (attempts - 1));
+      const backoff = Math.min(this.retry.maxMs, this.retry.baseMs * 2 ** Math.min(tries - 1, 20));
       try {
         await this.store.update(it.id, {
+          attempts,
           status: terminal ? 'error' : 'pending',
-          lastError: e instanceof Error ? e.message : String(e),
+          // Stored already translated: the queue is the only place that sees the raw
+          // failure, and the UI should never have to interpret one.
+          lastError: describeError(e),
           nextAttemptAt: terminal ? undefined : Date.now() + backoff
         });
       } catch {
@@ -180,7 +275,17 @@ export class UploadQueue {
    * deleted, it is at least marked 'done' so the drain stops treating it as work: without
    * that the same photo is uploaded again on every pass until it burns through maxAttempts.
    */
-  private async finish(id: string) {
+  private async finish(id: string, fingerprint?: string) {
+    if (fingerprint) {
+      // Recorded before the row is dropped: if the delete fails, the photograph is still
+      // known to have been sent and will not be queued again.
+      try {
+        await this.store.markSent?.(fingerprint);
+      } catch {
+        // Not fatal. The worst case is that re-picking this file uploads it again, and the
+        // server answers that duplicate with a 409 which counts as success anyway.
+      }
+    }
     try {
       await this.store.remove(id);
     } catch {

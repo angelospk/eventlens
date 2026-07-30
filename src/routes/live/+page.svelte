@@ -75,6 +75,17 @@
     if (e.key === 'ArrowLeft') move(-1);
   }
 
+  // When embedded, tell the host page how tall this content is. An iframe cannot size
+  // itself, so without this the gallery would be cut off at whatever fixed height the host
+  // guessed, and it grows every time a photo is approved.
+  let observer: ResizeObserver | null = null;
+
+  function reportHeight() {
+    if (window.parent === window) return;
+    const h = Math.ceil(document.documentElement.scrollHeight);
+    window.parent.postMessage({ type: 'eventlens:height', height: h }, '*');
+  }
+
   onMount(() => {
     if (!browser) return;
     const qd = new URLSearchParams(location.search).get('date');
@@ -84,11 +95,21 @@
     // Come back from a backgrounded tab with fresh photos rather than a stale grid.
     const onVisible = () => document.visibilityState === 'visible' && refresh();
     document.addEventListener('visibilitychange', onVisible);
-    return () => document.removeEventListener('visibilitychange', onVisible);
+
+    observer = new ResizeObserver(reportHeight);
+    observer.observe(document.documentElement);
+    // Images settle after the observer fires, so report again once they have loaded.
+    window.addEventListener('load', reportHeight);
+
+    return () => {
+      document.removeEventListener('visibilitychange', onVisible);
+      window.removeEventListener('load', reportHeight);
+    };
   });
 
   onDestroy(() => {
     if (timer !== null) clearInterval(timer);
+    observer?.disconnect();
     inflight?.abort();
   });
 </script>
@@ -115,7 +136,7 @@
     <div class="grid">
       {#each ordered as p, i (p.id)}
         <button class="cell" onclick={(e) => openAt(i, e)} aria-label="Άνοιγμα φωτογραφίας">
-          <img src={p.public_url} alt="" loading="lazy" decoding="async" />
+          <img src={p.public_url} alt="" loading="lazy" decoding="async" onload={reportHeight} />
         </button>
       {/each}
     </div>
