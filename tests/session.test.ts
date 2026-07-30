@@ -100,3 +100,58 @@ test('signing out clears the credentials it was holding', async () => {
   expect(s.authenticated).toBe(false);
   expect(await s.headers()).toEqual({});
 });
+
+test('the upload page runs on a manager token without asking for a second passcode', async () => {
+  // Simulates the manager signing in to moderate, then crossing over to upload: the token
+  // is already in storage under the manager's key.
+  const store: Record<string, string> = {};
+  const fake = {
+    getItem: (k: string) => store[k] ?? null,
+    setItem: (k: string, v: string) => { store[k] = v; },
+    removeItem: (k: string) => { delete store[k]; }
+  } as unknown as Storage;
+  (globalThis as any).localStorage = fake;
+  (globalThis as any).sessionStorage = fake;
+
+  store['eventlens.manager.token.v2'] = JSON.stringify({
+    token: 'manager-token',
+    expiresAt: Math.floor(Date.now() / 1000) + 3600
+  });
+
+  const asPhotographer = new Session(WORKER, 'photographer', async () => grantResponse(), ['manager']);
+  expect(asPhotographer.restore()).toBe(true);
+  expect(asPhotographer.borrowedRole).toBe('manager');
+  expect((await asPhotographer.headers()).authorization).toBe('Bearer manager-token');
+
+  // The reverse must NOT hold: a photographer token gives no manager rights.
+  delete store['eventlens.manager.token.v2'];
+  store['eventlens.photographer.token.v2'] = JSON.stringify({
+    token: 'photographer-token',
+    expiresAt: Math.floor(Date.now() / 1000) + 3600
+  });
+  const asManager = new Session(WORKER, 'manager', async () => grantResponse());
+  expect(asManager.restore()).toBe(false);
+
+  delete (globalThis as any).localStorage;
+  delete (globalThis as any).sessionStorage;
+});
+
+test('a manager passcode typed on the upload screen is accepted', async () => {
+  const tried: string[] = [];
+  const s = new Session(
+    WORKER,
+    'photographer',
+    async (_u, o: any) => {
+      const h = o.headers;
+      tried.push(Object.keys(h)[0]);
+      // Only the manager credential is valid here.
+      if (h['x-manager-passcode']) return grantResponse('mgr-token');
+      return new Response('{"error":"unauthorized"}', { status: 401 });
+    },
+    ['manager']
+  );
+
+  expect(await s.signIn('the-manager-passcode')).toBe('ok');
+  expect(tried).toEqual(['x-passcode', 'x-manager-passcode']); // own role first, then broader
+  expect((await s.headers()).authorization).toBe('Bearer mgr-token');
+});

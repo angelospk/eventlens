@@ -204,6 +204,7 @@
       </div>
       <input type="date" aria-label="Ημερομηνία βραδιάς" bind:value={date} onchange={loadList}
              style="width:auto" />
+      <a class="btn btn-sm" href="{base}/">Ανέβασμα</a>
       <button class="btn btn-sm" onclick={logout}>Έξοδος</button>
     </header>
 

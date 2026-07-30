@@ -28,7 +28,9 @@
   let unverified = $state(false);
   let queue: UploadQueue;
   let store: IdbStore;
-  const session = new Session(config.workerUrl, 'photographer');
+  // A manager's token is accepted here too: same person, and being asked for a second
+  // passcode just to upload is friction with nothing behind it.
+  const session = new Session(config.workerUrl, 'photographer', undefined, ['manager']);
 
   // One object URL per queued file, revoked as soon as the item leaves the queue so a long
   // night of shooting does not leak hundreds of blobs.
@@ -265,7 +267,7 @@
       <h1>EventLens</h1>
       <p class="sub">Ανέβασμα φωτογραφιών για τη βραδιά.</p>
       <form onsubmit={(e) => { e.preventDefault(); login(); }}>
-        <label for="pc">Κωδικός φωτογράφου</label>
+        <label for="pc">Κωδικός</label>
         <input id="pc" type="password" bind:value={passcode} placeholder="Ο κωδικός σου"
                autocomplete="current-password" />
         {#if loginError}<p class="error" style="margin-top:.6rem">{loginError}</p>{/if}
@@ -274,6 +276,10 @@
           {checking ? 'Έλεγχος' : 'Είσοδος'}
         </button>
       </form>
+
+      <p class="hint" style="margin-top:.75rem;font-size:.78rem">
+        Δουλεύει και με τον κωδικό διαχειριστή.
+      </p>
 
       {#if installEvent}
         <div class="install-inline">
@@ -299,6 +305,7 @@
         </div>
       </div>
       <span class="chip {connection.cls}">{connection.text}</span>
+      <a class="btn btn-sm" href="{base}/manager">Διαχείριση</a>
       <button class="btn btn-sm" onclick={logout}>Έξοδος</button>
     </header>
 

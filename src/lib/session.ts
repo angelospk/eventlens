@@ -60,49 +60,70 @@ export class Session {
   // Bumped on sign-out. A token request started before the user signed out must not write
   // its result afterwards, which would silently sign them back in.
   private epoch = 0;
+  // Which role the in-memory passcode belongs to, so an offline sign-in sends it in the
+  // right header once the network comes back.
+  private heldPasscodeRole: Role | null = null;
+
+  /**
+   * Which role's token is actually being held. Usually the page's own role, but the upload
+   * page happily runs on a manager's token.
+   */
+  private held: Role;
 
   /**
    * The manager can delete photos, so their token dies with the tab. The photographer's
    * survives a reload, which is what keeps a dropped phone from interrupting the night.
    */
-  private get store(): Storage | null {
+  private storeFor(role: Role): Storage | null {
     if (!hasStorage()) return null;
-    return this.role === 'manager' ? sessionStorage : localStorage;
+    return role === 'manager' ? sessionStorage : localStorage;
   }
 
   constructor(
     private workerUrl: string,
     public readonly role: Role,
-    private fetchImpl?: FetchLike
-  ) {}
+    private fetchImpl?: FetchLike,
+    /**
+     * Other roles whose token this page will happily run on. The upload page accepts a
+     * manager's, so someone who has already signed in to moderate can cross over to
+     * uploading without being asked for a second passcode.
+     */
+    private readonly alsoAccept: Role[] = []
+  ) {
+    this.held = role;
+  }
 
   /** Picks up a token left by a previous page load. Returns true if one is still valid. */
   restore(): boolean {
-    const store = this.store;
-    if (!store) return false;
-    const raw = safeGet(store, KEY(this.role));
-    if (!raw) return false;
-    try {
-      const { token, expiresAt } = JSON.parse(raw) as { token: string; expiresAt: number };
-      if (!token || expiresAt <= now()) {
-        safeRemove(store, KEY(this.role));
-        return false;
+    for (const role of [this.role, ...this.alsoAccept]) {
+      const store = this.storeFor(role);
+      if (!store) continue;
+      const raw = safeGet(store, KEY(role));
+      if (!raw) continue;
+      try {
+        const { token, expiresAt } = JSON.parse(raw) as { token: string; expiresAt: number };
+        if (!token || expiresAt <= now()) {
+          safeRemove(store, KEY(role));
+          continue;
+        }
+        this.token = token;
+        this.expiresAt = expiresAt;
+        this.held = role;
+        return true;
+      } catch {
+        safeRemove(store, KEY(role));
       }
-      this.token = token;
-      this.expiresAt = expiresAt;
-      return true;
-    } catch {
-      safeRemove(store, KEY(this.role));
-      return false;
     }
+    return false;
   }
 
-  private keep(grant: TokenGrant) {
+  private keep(grant: TokenGrant, role: Role) {
     this.token = grant.token;
     this.expiresAt = grant.expiresAt;
-    const store = this.store;
+    this.held = role;
+    const store = this.storeFor(role);
     if (store) {
-      safeSet(store, KEY(this.role), JSON.stringify({ token: grant.token, expiresAt: grant.expiresAt }));
+      safeSet(store, KEY(role), JSON.stringify({ token: grant.token, expiresAt: grant.expiresAt }));
     }
   }
 
@@ -115,16 +136,23 @@ export class Session {
   async signIn(passcode: string): Promise<'ok' | 'bad' | 'offline'> {
     const epoch = this.epoch;
     try {
-      const grant = await requestToken(
-        { workerUrl: this.workerUrl, fetchImpl: this.fetchImpl },
-        passcode,
-        this.role
-      );
-      if (epoch !== this.epoch) return 'bad'; // signed out while this was in flight
-      if (!grant) return 'bad';
-      this.passcode = passcode;
-      this.keep(grant);
-      return 'ok';
+      // Tried as this page's own role first, then as any role it also accepts, so the
+      // manager's passcode works on the upload screen without a second credential.
+      for (const role of [this.role, ...this.alsoAccept]) {
+        const grant = await requestToken(
+          { workerUrl: this.workerUrl, fetchImpl: this.fetchImpl },
+          passcode,
+          role
+        );
+        if (epoch !== this.epoch) return 'bad'; // signed out while this was in flight
+        if (grant) {
+          this.passcode = passcode;
+          this.heldPasscodeRole = role;
+          this.keep(grant, role);
+          return 'ok';
+        }
+      }
+      return 'bad';
     } catch {
       if (epoch !== this.epoch) return 'bad';
       this.passcode = passcode;
@@ -155,10 +183,11 @@ export class Session {
     if (this.passcode) {
       const epoch = this.epoch;
       // One mint at a time: a queue draining ten photos must not fire ten /auth calls.
+      const role = this.heldPasscodeRole ?? this.role;
       this.inflight ??= requestToken(
         { workerUrl: this.workerUrl, fetchImpl: this.fetchImpl },
         this.passcode,
-        this.role
+        role
       ).finally(() => {
         this.inflight = null;
       });
@@ -166,7 +195,7 @@ export class Session {
         const grant = await this.inflight;
         if (epoch !== this.epoch) return {}; // signed out mid-flight; send nothing
         if (grant) {
-          this.keep(grant);
+          this.keep(grant, role);
           return { authorization: `Bearer ${this.token}` };
         }
         // Rejected: fall through and let the passcode produce a clean 401 downstream, so
@@ -175,7 +204,7 @@ export class Session {
         // Unreachable: the passcode header below still works once connectivity returns.
       }
       if (epoch !== this.epoch || !this.passcode) return {};
-      const header = this.role === 'manager' ? 'x-manager-passcode' : 'x-passcode';
+      const header = role === 'manager' ? 'x-manager-passcode' : 'x-passcode';
       return { [header]: this.passcode };
     }
 
@@ -183,14 +212,21 @@ export class Session {
     return this.token ? { authorization: `Bearer ${this.token}` } : {};
   }
 
+  /** True when this page is running on a token issued for a different, broader role. */
+  get borrowedRole(): Role | null {
+    return this.held === this.role ? null : this.held;
+  }
+
   signOut() {
     this.epoch++;
     this.inflight = null;
     this.passcode = null;
+    this.heldPasscodeRole = null;
+    this.held = this.role;
     this.token = null;
     this.expiresAt = 0;
-    const store = this.store;
-    if (store) safeRemove(store, KEY(this.role));
+    const own = this.storeFor(this.role);
+    if (own) safeRemove(own, KEY(this.role));
     // A token for the other role may be sitting in the other storage from an earlier
     // session on this device; clear both so "sign out" means it.
     if (hasStorage()) {

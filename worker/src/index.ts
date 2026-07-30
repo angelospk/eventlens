@@ -116,8 +116,12 @@ export default {
         return json({ error: 'too_many_attempts' }, env, 429);
       }
     }
-    const isPhotographer = auth.role === 'photographer';
     const isManager = auth.role === 'manager';
+    // A manager may do everything a photographer may. It is usually the same person with a
+    // phone in one hand and a laptop in the other, and making them carry a second passcode
+    // just to upload buys no security: they can already approve and delete. The reverse
+    // never holds - a photographer token is refused everywhere `isManager` is required.
+    const isPhotographer = auth.role === 'photographer' || isManager;
 
     // The cached /wall payload for one night. Normalised so ?date=X&anything-else cannot
     // fragment the cache, and shared by the read path and every write that invalidates it.
