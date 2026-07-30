@@ -6,15 +6,18 @@
   import { fetchWall } from '$lib/wall-client';
   import type { WallPhoto } from '$lib/types';
 
-  // The public page for guests. Read-only, no passcode, and deliberately cheap: the Worker
-  // response is edge-cached, so a full room refreshing costs very few database reads.
+  // The public page for guests, and the one that gets embedded in ardasfestival.gr. It is
+  // deliberately plain: a date and the photographs. Everything else (status chips, counts,
+  // a second heading repeating the word "photos") is noise inside a host page that already
+  // has its own header and its own title for the section.
+  //
+  // Read-only, no passcode, and cheap: the Worker response is edge-cached, so a full venue
+  // refreshing this costs very few database reads.
   const POLL_MS = 20000;
 
   let date = $state(today());
-  let title = $state<string | null>(null);
   let photos = $state<WallPhoto[]>([]);
   let loaded = $state(false);
-  let offline = $state(false);
   let lightboxIndex = $state<number | null>(null);
 
   let timer: ReturnType<typeof setInterval> | null = null;
@@ -22,7 +25,7 @@
 
   // Newest first: on a live page the last photo taken is the one people want to see.
   const ordered = $derived([...photos].reverse());
-  const heading = $derived(title ?? 'Φωτογραφίες της βραδιάς');
+  const heading = $derived(formatGreek(date));
 
   async function refresh() {
     inflight?.abort();
@@ -34,18 +37,15 @@
         date
       );
       photos = res.photos;
-      title = res.title;
-      offline = false;
     } catch {
       // Keep whatever is already on screen and try again on the next tick.
-      if (!signal.aborted) offline = true;
     } finally {
       loaded = true;
     }
   }
 
-  // Returns focus to the grid when the dialog closes, so keyboard users are not dumped at
-  // the top of the document.
+  // Returns focus to the thumbnail when the lightbox closes, so keyboard users are not
+  // dumped at the top of the document.
   let lastTrigger: HTMLElement | null = null;
 
   function autofocus(node: HTMLElement) {
@@ -95,38 +95,24 @@
 
 <svelte:head>
   <title>{heading}</title>
-  <meta name="description" content="Οι φωτογραφίες της βραδιάς, ζωντανά." />
+  <meta name="description" content="Οι φωτογραφίες της βραδιάς." />
 </svelte:head>
 
 <svelte:window onkeydown={onKey} />
 
-<div class="shell">
-  <header class="head">
-    <h1>{heading}</h1>
-    <p class="hint">{formatGreek(date)}</p>
-    <div class="status">
-      <span class="chip {offline ? 'chip-warn' : 'chip-ok'}">
-        {offline ? 'Χωρίς σύνδεση' : 'Ζωντανά'}
-      </span>
-      {#if loaded}
-        <span class="hint">{photos.length} φωτογραφίες</span>
-      {/if}
-    </div>
-  </header>
+<div class="page">
+  <h1>{heading}</h1>
 
   {#if !loaded}
-    <div class="masonry">
-      {#each Array(9) as _, i (i)}
-        <div class="skeleton" style="height:{160 + (i % 3) * 60}px"></div>
+    <div class="grid" aria-hidden="true">
+      {#each Array(8) as _, i (i)}
+        <div class="ph" style="height:{170 + (i % 3) * 70}px"></div>
       {/each}
     </div>
   {:else if ordered.length === 0}
-    <div class="empty">
-      <p>Δεν υπάρχουν ακόμα φωτογραφίες.</p>
-      <p class="hint">Η σελίδα ανανεώνεται μόνη της, άφησέ την ανοιχτή.</p>
-    </div>
+    <p class="empty">Δεν υπάρχουν ακόμα φωτογραφίες.</p>
   {:else}
-    <div class="masonry">
+    <div class="grid">
       {#each ordered as p, i (p.id)}
         <button class="cell" onclick={(e) => openAt(i, e)} aria-label="Άνοιγμα φωτογραφίας">
           <img src={p.public_url} alt="" loading="lazy" decoding="async" />
@@ -141,87 +127,112 @@
     <img src={ordered[lightboxIndex].public_url} alt="" />
     <button class="nav prev" onclick={() => move(-1)} aria-label="Προηγούμενη">‹</button>
     <button class="nav next" onclick={() => move(1)} aria-label="Επόμενη">›</button>
-    <!-- Focused on open so Escape and the arrow keys work without a click first, and so a
-         screen reader lands inside the dialog rather than behind it. -->
     <button class="close" onclick={() => (lightboxIndex = null)} aria-label="Κλείσιμο"
             use:autofocus>×</button>
   </div>
 {/if}
 
 <style>
-  .head {
-    padding-block: 1.5rem 1.75rem;
+  /* This page is light while the rest of the app is dark, because it is the only one that
+     gets embedded in ardasfestival.gr. Its palette is taken from that site: white ground,
+     black Poppins headings, grey secondary text, and photographs butted together with
+     square corners. A dark panel dropped into a white page would read as a foreign object. */
+  :global(html),
+  :global(body) {
+    background: #fff;
+    color: #8a8a8a;
+    /* Poppins to match the host. It has no Greek glyphs, so Greek falls through to the
+       system face exactly as it does on ardasfestival.gr itself. */
+    font-family: 'Poppins', system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
   }
 
-  .head h1 {
-    font-size: clamp(1.5rem, 5vw, 2.25rem);
+  .page {
+    max-width: 1140px;
+    margin: 0 auto;
+    padding: clamp(1.25rem, 4vw, 2.5rem) clamp(0.75rem, 3vw, 1.5rem) 3rem;
+  }
+
+  h1 {
+    margin: 0 0 clamp(1rem, 3vw, 1.75rem);
+    color: #000;
     font-weight: 600;
-    margin-bottom: 0.35rem;
+    font-size: clamp(1.6rem, 5vw, 2.5rem);
+    line-height: 1.15;
+    letter-spacing: -0.01em;
   }
 
-  .status {
-    display: flex;
-    align-items: center;
-    gap: 0.6rem;
-    margin-top: 0.9rem;
-  }
-
-  /* Columns rather than a square grid: event photos are a mix of portrait and landscape,
-     and cropping them all to squares throws away most of what the photographer framed. */
-  .masonry {
+  /* Columns rather than a square grid: event photos mix portrait and landscape, and
+     cropping them all square throws away most of what the photographer framed. The host
+     gallery butts its images together, so there is no gutter here either. */
+  .grid {
     columns: 2;
-    column-gap: 0.6rem;
+    column-gap: 0;
   }
 
-  @media (min-width: 640px) {
-    .masonry {
+  @media (min-width: 700px) {
+    .grid {
       columns: 3;
     }
   }
 
   @media (min-width: 1000px) {
-    .masonry {
+    .grid {
       columns: 4;
     }
   }
 
   .cell,
-  .skeleton {
+  .ph {
     display: block;
     width: 100%;
     break-inside: avoid;
-    margin-bottom: 0.6rem;
+    margin: 0;
+  }
+
+  .ph {
+    background: #f2f2f2;
   }
 
   .cell {
     padding: 0;
-    border: none;
-    background: var(--surface);
-    border-radius: var(--r-card);
-    overflow: hidden;
+    border: 0;
+    background: #f2f2f2;
     cursor: zoom-in;
+    overflow: hidden;
+    line-height: 0;
   }
 
   .cell img {
     display: block;
     width: 100%;
     height: auto;
-    transition: transform 0.25s ease;
+    transition: opacity 0.2s ease;
   }
 
   .cell:hover img {
-    transform: scale(1.02);
+    opacity: 0.86;
+  }
+
+  .cell:focus-visible {
+    outline: 2px solid #1863dc;
+    outline-offset: -2px;
+  }
+
+  .empty {
+    margin: 0;
+    padding: 3rem 0;
+    color: #8a8a8a;
   }
 
   .lightbox {
     position: fixed;
     inset: 0;
-    background: rgb(0 0 0 / 0.94);
+    background: rgb(0 0 0 / 0.92);
     display: flex;
     align-items: center;
     justify-content: center;
     padding: 3vmin;
-    z-index: 50;
+    z-index: 2147483000; /* above anything the host page stacks around the embed */
   }
 
   .lightbox img {
@@ -233,10 +244,10 @@
   .nav,
   .close {
     position: absolute;
-    background: rgb(255 255 255 / 0.1);
-    border: 1px solid rgb(255 255 255 / 0.18);
+    background: rgb(255 255 255 / 0.12);
+    border: 1px solid rgb(255 255 255 / 0.25);
     color: #fff;
-    border-radius: var(--r-pill);
+    border-radius: 999px;
     cursor: pointer;
     line-height: 1;
   }
@@ -262,5 +273,11 @@
     width: 40px;
     height: 40px;
     font-size: 1.3rem;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .cell img {
+      transition: none;
+    }
   }
 </style>
