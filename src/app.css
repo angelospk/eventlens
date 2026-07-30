@@ -297,3 +297,17 @@ input:focus {
     transition-duration: 0.001ms !important;
   }
 }
+
+/* Hides the real file input behind the big styled picker label.
+   Deliberately global rather than scoped to the page: page CSS is a lazily loaded chunk,
+   and until it arrives the browser paints its native "Choose file / No file chosen"
+   control in the middle of the screen. */
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  clip-path: inset(50%);
+  white-space: nowrap;
+}

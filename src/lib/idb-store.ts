@@ -140,3 +140,71 @@ export class IdbStore implements QueueStore {
     return Boolean(row);
   }
 }
+
+/**
+ * The queue with no database behind it.
+ *
+ * IndexedDB can refuse to open: another tab holding an older schema, Safari in private
+ * mode, a profile with storage disabled. Before this existed, that refusal stopped the
+ * photographer from queueing anything at all, which at an event is the worst possible
+ * failure — the photographs are right there and the app says no.
+ *
+ * Everything works exactly as before while the app stays open. The only thing lost is
+ * surviving a reload, which is a far smaller problem than not being able to upload.
+ */
+export class MemoryStore implements QueueStore {
+  private items = new Map<string, QueueItem>();
+  private sent = new Set<string>();
+
+  async add(item: QueueItem) {
+    this.items.set(item.id, { ...item });
+  }
+
+  async update(id: string, patch: Partial<QueueItem>) {
+    const cur = this.items.get(id);
+    if (cur) this.items.set(id, { ...cur, ...patch });
+  }
+
+  async remove(id: string) {
+    this.items.delete(id);
+  }
+
+  async all() {
+    return [...this.items.values()];
+  }
+
+  async markSent(fingerprint: string) {
+    this.sent.add(fingerprint);
+  }
+
+  async wasSent(fingerprint: string) {
+    return this.sent.has(fingerprint);
+  }
+}
+
+export interface QueueStorage {
+  store: QueueStore & { markSent(f: string): Promise<void>; wasSent(f: string): Promise<boolean> };
+  /** True when the database was unavailable and the queue lives only in memory. */
+  ephemeral: boolean;
+  reason?: string;
+}
+
+/**
+ * Opens the durable queue, falling back to memory rather than failing the upload.
+ *
+ * The probe is a real read, not just an open: a database that opens and then rejects every
+ * transaction would otherwise pass here and fail on the first photograph.
+ */
+export async function createQueueStorage(dbName = 'eventlens-queue'): Promise<QueueStorage> {
+  const idb = new IdbStore(dbName);
+  try {
+    await idb.all();
+    return { store: idb, ephemeral: false };
+  } catch (e) {
+    return {
+      store: new MemoryStore(),
+      ephemeral: true,
+      reason: e instanceof Error ? e.message : String(e)
+    };
+  }
+}

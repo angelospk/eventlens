@@ -4,7 +4,7 @@
   import { base } from '$app/paths';
   import { config } from '$lib/config';
   import { today, formatNight } from '$lib/date';
-  import { IdbStore } from '$lib/idb-store';
+  import { createQueueStorage, type QueueStorage } from '$lib/idb-store';
   import { UploadQueue } from '$lib/upload-queue';
   import { makeR2Uploader, type Stage } from '$lib/r2-client';
   import { Session } from '$lib/session';
@@ -26,8 +26,10 @@
   // Signing in offline is deliberate, but it must not look like a verified session: a typo
   // would otherwise be discovered only when the first upload fails.
   let unverified = $state(false);
+  // True when the queue lives only in memory because the database would not open.
+  let ephemeral = $state(false);
   let queue: UploadQueue;
-  let store: IdbStore;
+  let store: QueueStorage['store'];
   // A manager's token is accepted here too: same person, and being asked for a second
   // passcode just to upload is friction with nothing behind it.
   const session = new Session(config.workerUrl, 'photographer', undefined, ['manager']);
@@ -74,8 +76,12 @@
     if (unverified && session.verified) unverified = false;
   }
 
-  function start() {
-    store = new IdbStore();
+  async function start() {
+    // Falls back to an in-memory queue rather than refusing to accept photographs when the
+    // database will not open. Losing the queue on reload beats not being able to upload.
+    const storage = await createQueueStorage();
+    store = storage.store;
+    ephemeral = storage.ephemeral;
     const uploader = makeR2Uploader({
       workerUrl: config.workerUrl,
       auth: () => session.headers(),
@@ -354,6 +360,16 @@
     </label>
     <input id="files" class="visually-hidden" type="file" accept="image/*,.heic,.heif,.HEIC,.HEIF" multiple onchange={onPick} />
 
+    {#if ephemeral}
+      <div class="notice">
+        <strong>Μην κλείσεις την εφαρμογή</strong>
+        <span class="hint">
+          Η συσκευή δεν επιτρέπει τοπική αποθήκευση, οπότε η ουρά κρατιέται μόνο στη μνήμη.
+          Οι φωτογραφίες ανεβαίνουν κανονικά, αλλά αν κλείσεις τη σελίδα πριν ανέβουν, χάνονται.
+        </span>
+      </div>
+    {/if}
+
     {#if unverified && online}
       <div class="notice">
         <strong>Ο κωδικός δεν επιβεβαιώθηκε</strong>
@@ -482,14 +498,6 @@
     color: var(--text);
   }
 
-  .visually-hidden {
-    position: absolute;
-    width: 1px;
-    height: 1px;
-    overflow: hidden;
-    clip: rect(0 0 0 0);
-    white-space: nowrap;
-  }
 
   .banner {
     display: flex;

@@ -321,3 +321,38 @@ test('a success clears the weak-signal flag', async () => {
   await q.retryAll();
   expect(q.struggling).toBe(false);
 });
+
+test('the in-memory fallback behaves like a real queue', async () => {
+  // What matters is not how the fallback is chosen but that photographs still upload
+  // through it: on a device where the database will not open, this is the whole queue.
+  const { MemoryStore } = await import('../src/lib/idb-store');
+  const store = new MemoryStore();
+
+  const uploaded: string[] = [];
+  const q = new UploadQueue(
+    store,
+    { async run(it: QueueItem) { uploaded.push(it.id); } },
+    { baseMs: 1, maxMs: 4, maxAttempts: 3 }
+  );
+  await q.enqueue({ ...item('mem1'), queuedAt: 1 });
+  await q.enqueue({ ...item('mem2'), queuedAt: 2 });
+  await q.drain();
+
+  expect(uploaded).toEqual(['mem1', 'mem2']);
+  expect(await store.all()).toEqual([]);
+  expect(q.completed).toBe(2);
+
+  // The duplicate guard has to keep working, or a retried night re-uploads everything.
+  await store.markSent('fp-1');
+  expect(await store.wasSent('fp-1')).toBe(true);
+  expect(await store.wasSent('fp-2')).toBe(false);
+});
+
+test('createQueueStorage always returns a usable queue', async () => {
+  const { createQueueStorage } = await import('../src/lib/idb-store');
+  const storage = await createQueueStorage('eventlens-test-queue');
+  // Whichever path it took, the caller must be able to queue a photograph.
+  await storage.store.add(item('probe'));
+  expect((await storage.store.all()).map((i) => i.id)).toContain('probe');
+  await storage.store.remove('probe');
+});
