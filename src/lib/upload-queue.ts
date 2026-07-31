@@ -124,10 +124,33 @@ export class UploadQueue {
     this.onChange();
   }
 
-  // Cross-tab single-flight via Web Locks (no-op in non-browser test env).
-  private withLock<T>(fn: () => Promise<T>): Promise<T> {
+  /**
+   * Cross-tab single-flight, but never at the cost of not uploading at all.
+   *
+   * A plain `locks.request` waits for the lock forever. iOS does not reliably tear a page
+   * down when the app is closed: a frozen previous instance can still hold it, and the new
+   * one then waits for a release that is never coming. The photographs sit there, the
+   * statuses stay as they were, and nothing explains it.
+   *
+   * So the lock is asked for, not waited on. If something else genuinely holds it we back
+   * off briefly and ask again; if it is still held we go ahead anyway. Two drains at once
+   * is wasteful but safe, because the server answers a photograph it already has with a
+   * 409 that counts as success. A queue that never runs is not safe at all.
+   */
+  private async withLock<T>(fn: () => Promise<T>): Promise<T> {
     const locks = (globalThis as any).navigator?.locks;
-    return locks?.request ? locks.request('eventlens-upload', fn) : fn();
+    if (!locks?.request) return fn();
+
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const result = await locks.request(
+        'eventlens-upload',
+        { ifAvailable: true },
+        async (lock: unknown) => (lock ? { held: true, value: await fn() } : { held: false })
+      );
+      if (result.held) return result.value as T;
+      await sleep(1500);
+    }
+    return fn();
   }
 
   /**
@@ -169,10 +192,12 @@ export class UploadQueue {
   }
 
   private async run() {
+    // Outside the lock on purpose: this only repairs how things are described, and it has
+    // to happen even when another context is doing the uploading.
+    await this.reclaimInterrupted();
     await this.withLock(async () => {
       this.running = true;
       try {
-        await this.reclaimInterrupted();
         do {
           this.dirty = false;
           // Items the store itself refused to touch this pass. Without this the loop would

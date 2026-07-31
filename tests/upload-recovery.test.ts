@@ -531,3 +531,34 @@ test('rows left mid-flight by a kill are put back in line, not shown as uploadin
   expect(uploaded.sort()).toEqual(['killed1', 'killed2']);
   expect(await store.all()).toEqual([]);
 });
+
+test('a lock held by a frozen previous instance does not stop the queue forever', async () => {
+  // iOS does not reliably tear a page down when the app is closed. If the old instance
+  // still holds the Web Lock, waiting for it means never uploading again.
+  const store = new MemStore();
+  const uploaded: string[] = [];
+  const q = new UploadQueue(
+    store,
+    { async run(it: QueueItem) { uploaded.push(it.id); } },
+    { baseMs: 1, maxMs: 4, maxAttempts: 3 }
+  );
+  await q.enqueue(item('waiting'));
+
+  // A lock manager that never grants anything, the way a wedged holder looks from here.
+  const original = (globalThis as any).navigator;
+  (globalThis as any).navigator = {
+    locks: {
+      request: async (_n: string, opts: any, cb: any) =>
+        // `ifAvailable` hands back null rather than queueing behind the holder.
+        opts?.ifAvailable ? cb(null) : new Promise(() => {})
+    }
+  };
+
+  try {
+    await q.drain();
+    expect(uploaded).toEqual(['waiting']); // went ahead rather than waiting for ever
+    expect(await store.all()).toEqual([]);
+  } finally {
+    (globalThis as any).navigator = original;
+  }
+}, 20000);
