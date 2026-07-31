@@ -12,6 +12,7 @@
   } from '$lib/manager-client';
   import { downloadOne, exportPhotos, ExportTooLargeError, type ExportProgress } from '$lib/export-photos';
   import { Session } from '$lib/session';
+  import { uploads } from '$lib/uploads.svelte';
   import type { EventSettings, Moderation, PhotoListItem } from '$lib/types';
 
   let passcode = $state('');
@@ -237,6 +238,8 @@
       }
       passcode = '';
       loggedIn = true;
+      // The same token uploads, so the queue can get going without a second sign-in.
+      if (uploads.session.restore()) uploads.start();
       await loadList();
     } finally {
       checking = false;
@@ -324,10 +327,13 @@
         : { text: 'Για έγκριση', cls: 'chip-warn' };
 
   onMount(() => {
-    // A token from earlier in this tab means no passcode prompt.
+    // A token from an earlier visit means no passcode prompt.
     if (session.restore()) {
       loggedIn = true;
       loadList();
+      // A manager's token uploads too, so anything left in the queue keeps going up while
+      // this screen is open rather than waiting for someone to open the upload page.
+      if (uploads.session.restore()) uploads.start();
     }
   });
 </script>

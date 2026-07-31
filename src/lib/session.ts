@@ -74,9 +74,19 @@ export class Session {
    * The manager can delete photos, so their token dies with the tab. The photographer's
    * survives a reload, which is what keeps a dropped phone from interrupting the night.
    */
-  private storeFor(role: Role): Storage | null {
+  /**
+   * Both roles persist, so neither passcode has to be typed again after the app is closed.
+   * The manager's used to live in sessionStorage, which on a phone means retyping it every
+   * single time the app is reopened — during an event that is many times a night, on a
+   * screen the manager is switching to and from constantly.
+   *
+   * What is stored is a short-lived token, never the passcode, and the origin is shared
+   * with the account's other GitHub Pages projects: the exposure is a token that expires
+   * on its own and that rotating TOKEN_SECRET revokes.
+   */
+  private storeFor(_role: Role): Storage | null {
     if (!hasStorage()) return null;
-    return role === 'manager' ? sessionStorage : localStorage;
+    return localStorage;
   }
 
   constructor(
@@ -230,8 +240,12 @@ export class Session {
     // A token for the other role may be sitting in the other storage from an earlier
     // session on this device; clear both so "sign out" means it.
     if (hasStorage()) {
-      safeRemove(localStorage, KEY('photographer'));
-      safeRemove(sessionStorage, KEY('manager'));
+      // Both keys from both stores: the manager's token used to live in sessionStorage,
+      // so a device that has been through the change can hold one in either place.
+      for (const store of [localStorage, sessionStorage]) {
+        safeRemove(store, KEY('photographer'));
+        safeRemove(store, KEY('manager'));
+      }
       // Remove the pre-token key too, so an upgrade does not leave a passcode behind.
       safeRemove(localStorage, 'eventlens.photographer.v1');
       safeRemove(sessionStorage, 'eventlens.manager.v1');

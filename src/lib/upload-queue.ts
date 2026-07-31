@@ -164,83 +164,22 @@ export class UploadQueue {
   }
 
   /**
-   * Cross-tab single-flight that can still tell a busy holder from a dead one.
+   * Cross-context single-flight. Two windows on the same database would otherwise each
+   * pick photographs the other is already sending, and each reset rows the other is
+   * mid-way through, so neither finishes.
    *
-   * Two problems pull in opposite directions. A plain `locks.request` waits forever, and
-   * iOS does not reliably tear a page down when the app is closed, so a frozen previous
-   * instance can hold the lock and the new one waits for a release that never comes.
-   * Bypassing the lock on a timer instead is worse: two live instances then drain the same
-   * database at once, each resetting rows the other is working on, and nothing finishes
-   * while the queue looks like six photographs uploading simultaneously.
-   *
-   * So the holder proves it is alive. It stamps a shared heartbeat while it works, and a
-   * waiter only takes over once that heartbeat has stopped. A busy holder is waited for,
-   * however long it takes; a frozen one is stepped over within a few seconds.
+   * A plain request, waited on, is the whole mechanism. An earlier version stepped over
+   * the lock once a shared heartbeat went quiet, on the theory that a frozen page could
+   * hold it forever — but a heartbeat only proves a timer fired, not that anything is
+   * being uploaded, and a phone that suspends a background tab produces both false
+   * readings: beats too fresh to ever take over, and beats stale enough to take over from
+   * a holder that then wakes up and carries on. Locks are released when a document goes
+   * away, so waiting is both correct and sufficient.
    */
   private async withLock<T>(fn: () => Promise<T>): Promise<T> {
     const locks = (globalThis as any).navigator?.locks;
-    if (!locks?.request) return this.beating(fn);
-    // Without shared storage there is no way to tell the two cases apart, so fall back to
-    // waiting: a stalled queue is recoverable by reopening the app, duplicate drains are
-    // not something the photographer can see or fix.
-    if (!UploadQueue.canBeat()) {
-      return locks.request('eventlens-upload', () => this.beating(fn));
-    }
-
-    for (;;) {
-      const result = await locks.request(
-        'eventlens-upload',
-        { ifAvailable: true },
-        async (lock: unknown) => (lock ? { held: true, value: await this.beating(fn) } : { held: false })
-      );
-      if (result.held) return result.value as T;
-      if (this.stopped) return undefined as T;
-      if (Date.now() - UploadQueue.lastBeat() > UploadQueue.BEAT_STALE_MS) {
-        return this.beating(fn); // the holder stopped breathing
-      }
-      await sleep(2000); // someone else is genuinely uploading; let them finish
-    }
-  }
-
-  private static readonly BEAT_KEY = 'eventlens-drain-beat';
-  private static readonly BEAT_MS = 3000;
-  /** Four missed beats. Long enough that a busy holder is never mistaken for a dead one. */
-  private static readonly BEAT_STALE_MS = 12_000;
-
-  private static canBeat(): boolean {
-    try {
-      return typeof localStorage !== 'undefined' && localStorage !== null;
-    } catch {
-      return false; // storage blocked (private mode, embedded webview)
-    }
-  }
-
-  private static lastBeat(): number {
-    try {
-      return Number(localStorage.getItem(UploadQueue.BEAT_KEY)) || 0;
-    } catch {
-      return 0;
-    }
-  }
-
-  private static beat() {
-    try {
-      localStorage.setItem(UploadQueue.BEAT_KEY, String(Date.now()));
-    } catch {
-      // Storage full or blocked. The worst case is a waiter deciding we are dead and
-      // joining in, which is what the old code did unconditionally.
-    }
-  }
-
-  /** Runs the drain while telling every other instance that this one is still alive. */
-  private async beating<T>(fn: () => Promise<T>): Promise<T> {
-    UploadQueue.beat();
-    const timer = setInterval(() => UploadQueue.beat(), UploadQueue.BEAT_MS);
-    try {
-      return await fn();
-    } finally {
-      clearInterval(timer);
-    }
+    if (!locks?.request) return fn();
+    return locks.request('eventlens-upload', fn) as Promise<T>;
   }
 
   /**
@@ -306,15 +245,21 @@ export class UploadQueue {
 
   /** One pass: work through everything runnable until nothing is left to do right now. */
   private async run() {
-    // Outside the lock on purpose: this only repairs how things are described, and it has
-    // to happen even when another context is doing the uploading.
-    await this.reclaimInterrupted();
-    await this.withLock(async () => {
-      // Items the store itself refused to touch this pass. Without this the loop would
-      // pick the same unwritable item forever and spin the CPU.
-      const skip = new Set<string>();
-      for (;;) {
-        if (this.stopped) return;
+    // Items the store itself refused to touch this pass. Without this the loop would
+    // pick the same unwritable item forever and spin the CPU.
+    const skip = new Set<string>();
+    let repaired = false;
+    for (;;) {
+      if (this.stopped) return;
+      // The lock is taken per photograph rather than held across the whole pass: a queue
+      // sitting out a backoff must not keep another window from uploading meanwhile.
+      const wait = await this.withLock(async () => {
+        if (!repaired) {
+          // Inside the lock on purpose. A contender that repaired rows from outside would
+          // reset the holder's row while it was still being uploaded.
+          await this.reclaimInterrupted();
+          repaired = true;
+        }
         const items = (await this.store.all())
           .filter((i) => isRunnable(i, this.retry.maxAttempts) && !skip.has(i.id))
           // Fewest attempts first, then oldest.
@@ -326,20 +271,23 @@ export class UploadQueue {
           // that have not failed yet. Nothing is skipped, nothing is lost, the healthy
           // majority simply stops paying for the exception.
           .sort((a, b) => (a.tries ?? 0) - (b.tries ?? 0) || (a.queuedAt ?? 0) - (b.queuedAt ?? 0));
-        if (items.length === 0) break;
+        if (items.length === 0) return -1;
         const now = Date.now();
         // Prefer an item whose backoff has elapsed (or never failed).
         const ready = items.find((i) => !i.nextAttemptAt || i.nextAttemptAt <= now);
         if (ready) {
           if (!(await this.process(ready))) skip.add(ready.id);
-          continue;
+          return 0;
         }
-        // All runnable items are still in backoff: wait until the soonest, then loop.
-        // (A newly-enqueued item has no nextAttemptAt, so it would have been 'ready'.)
+        // Everything runnable is still in backoff: report how long, and wait for it with
+        // the lock released. (A newly-enqueued item has no nextAttemptAt, so it would
+        // have been 'ready'.)
         const soonest = Math.min(...items.map((i) => i.nextAttemptAt as number));
-        await this.waitUntil(Math.max(0, soonest - now));
-      }
-    });
+        return Math.max(0, soonest - now);
+      });
+      if (wait < 0) return;
+      if (wait > 0) await this.waitUntil(wait);
+    }
   }
 
   /**
@@ -449,7 +397,13 @@ export class UploadQueue {
     } finally {
       // Only if this attempt is still the current one: a retry may have already handed the
       // slot to a newer attempt, and clearing it here would disown that one instead.
-      if (this.inFlight.get(it.id) === controller) this.inFlight.delete(it.id);
+      if (this.inFlight.get(it.id) === controller) {
+        this.inFlight.delete(it.id);
+        // Announced after clearing, not before. The interface reads `activeId` from this
+        // map, so without a second notification a photograph waiting out a backoff keeps
+        // being described as uploading.
+        this.onChange();
+      }
     }
   }
 

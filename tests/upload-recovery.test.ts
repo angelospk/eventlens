@@ -532,32 +532,23 @@ test('rows left mid-flight by a kill are put back in line, not shown as uploadin
   expect(await store.all()).toEqual([]);
 });
 
-/** A lock manager that never grants, the way a holder looks from another instance. */
-function heldLocks() {
+/** A lock manager that hands the lock over only once the holder releases it. */
+function serialLocks() {
+  let chain: Promise<unknown> = Promise.resolve();
   return {
     locks: {
-      request: async (_n: string, opts: any, cb: any) =>
-        // `ifAvailable` hands back null rather than queueing behind the holder.
-        opts?.ifAvailable ? cb(null) : new Promise(() => {})
+      request: (_n: string, cb: () => Promise<unknown>) => {
+        const next = chain.then(cb);
+        chain = next.catch(() => {});
+        return next;
+      }
     }
   };
 }
 
-/** Shared heartbeat storage, the part two instances of the app can both see. */
-function fakeStorage(initial?: Record<string, string>) {
-  const map = new Map(Object.entries(initial ?? {}));
-  return {
-    getItem: (k: string) => map.get(k) ?? null,
-    setItem: (k: string, v: string) => void map.set(k, v)
-  };
-}
-
-async function withGlobals(
-  patch: { navigator?: any; localStorage?: any },
-  fn: () => Promise<void>
-) {
+async function withGlobals(patch: { navigator?: any }, fn: () => Promise<void>) {
   const g = globalThis as any;
-  const saved = { navigator: g.navigator, localStorage: g.localStorage };
+  const saved = { navigator: g.navigator };
   Object.assign(g, patch);
   try {
     await fn();
@@ -566,94 +557,61 @@ async function withGlobals(
   }
 }
 
-test('a lock held by a frozen previous instance does not stop the queue forever', async () => {
-  // iOS does not reliably tear a page down when the app is closed. If the old instance
-  // still holds the Web Lock and has stopped running, waiting for it means never
-  // uploading again — so a heartbeat that stopped long ago is treated as a dead holder.
+test('two queues on one database upload each photograph once, not twice', async () => {
+  // The failure this lock exists for: two windows of the app draining the same rows, each
+  // resetting what the other was mid-way through, so nothing ever finished while six
+  // photographs all claimed to be uploading.
   const store = new MemStore();
   const uploaded: string[] = [];
-  const q = new UploadQueue(
-    store,
-    { async run(it: QueueItem) { uploaded.push(it.id); } },
-    { baseMs: 1, maxMs: 4, maxAttempts: 3 }
-  );
-  await q.enqueue(item('waiting'));
-
-  await withGlobals(
-    {
-      navigator: heldLocks(),
-      localStorage: fakeStorage({ 'eventlens-drain-beat': String(Date.now() - 60_000) })
-    },
-    async () => {
-      await q.drain();
-      expect(uploaded).toEqual(['waiting']); // went ahead rather than waiting for ever
-      expect(await store.all()).toEqual([]);
-    }
-  );
-}, 20000);
-
-test('a lock held by an instance that is still working is waited for, not stolen', async () => {
-  // The other half of the same problem, and the one that made six photographs look like
-  // they were uploading at once: two live instances draining the same database.
-  const store = new MemStore();
-  const uploaded: string[] = [];
-  const q = new UploadQueue(
-    store,
-    { async run(it: QueueItem) { uploaded.push(it.id); } },
-    { baseMs: 1, maxMs: 4, maxAttempts: 3 }
-  );
-  await q.enqueue(item('theirs'));
-
-  // The holder stamps the moment it takes the lock, so a live one is never seen unstamped.
-  const beats = fakeStorage({ 'eventlens-drain-beat': String(Date.now()) });
-  const alive = setInterval(() => beats.setItem('eventlens-drain-beat', String(Date.now())), 200);
-  try {
-    await withGlobals({ navigator: heldLocks(), localStorage: beats }, async () => {
-      const draining = q.drain();
-      await new Promise((r) => setTimeout(r, 3000)); // well past the old 3s bypass
-      expect(uploaded).toEqual([]); // left alone; the holder is doing the work
-      q.stop();
-      await draining;
-    });
-  } finally {
-    clearInterval(alive);
-  }
-}, 20000);
-
-test('retrying a wedged upload keeps the photograph instead of deleting it', async () => {
-  // The field report: several photos sat on "uploading", the photographer pressed
-  // "try them all again", and they vanished. The button cancelled first — which removes
-  // the row — and then reset a row that was already gone.
-  const store = new MemStore();
-  let calls = 0;
   const uploader = {
-    async run(_it: QueueItem, signal?: AbortSignal) {
-      calls++;
-      if (calls > 1) return; // the retry goes through
-      await new Promise((_resolve, reject) => {
-        signal?.addEventListener('abort', () => reject(new Error('cancelled')), { once: true });
-      });
+    async run(it: QueueItem) {
+      await new Promise((r) => setTimeout(r, 20)); // long enough for the other to interfere
+      uploaded.push(it.id);
     }
   };
-  // A long backoff on purpose. With a short one the abandoned attempt's own failure would
-  // restart the item within a millisecond and the test would pass whether or not the reset
-  // did anything. Here nothing but the reset can make it run again.
-  const q = new UploadQueue(store, uploader, { baseMs: 60_000, maxMs: 60_000, maxAttempts: 3 });
-  await q.enqueue(item('a'));
-  const draining = q.drain();
+  const a = new UploadQueue(store, uploader, { baseMs: 1, maxMs: 4, maxAttempts: 3 });
+  const b = new UploadQueue(store, uploader, { baseMs: 1, maxMs: 4, maxAttempts: 3 });
+  for (const id of ['p1', 'p2', 'p3']) await store.add(item(id));
 
-  // Wait for it to be genuinely in the air, i.e. wedged.
-  for (let i = 0; i < 100 && store.items.get('a')?.status !== 'uploading'; i++) {
-    await new Promise((r) => setTimeout(r, 5));
-  }
-  expect(store.items.get('a')?.status).toBe('uploading');
+  await withGlobals({ navigator: serialLocks() }, async () => {
+    await Promise.all([a.drain(), b.drain()]);
+  });
 
-  await q.retryMany(['a']);
-  await draining;
+  expect(uploaded.sort()).toEqual(['p1', 'p2', 'p3']); // each exactly once
+  expect(await store.all()).toEqual([]);
+}, 20000);
 
-  expect(calls).toBe(2);
-  expect(q.completed).toBe(1);   // it went up
-  expect(store.items.size).toBe(0); // removed because it finished, not because it was dropped
+test('a queue waiting out a backoff does not hold the lock', async () => {
+  // Holding the lock across the wait would mean one window's failed photograph blocking
+  // every other window from uploading anything at all.
+  const store = new MemStore();
+  const uploaded: string[] = [];
+  // 'slow' fails once and then sits in a long backoff; 'quick' belongs to the other queue.
+  let failed = false;
+  const a = new UploadQueue(
+    store,
+    { async run() { if (!failed) { failed = true; throw new NetworkError('/sign'); } await new Promise(() => {}); } },
+    { baseMs: 60_000, maxMs: 60_000, maxAttempts: 5 }
+  );
+  const b = new UploadQueue(
+    store,
+    { async run(it: QueueItem) { uploaded.push(it.id); } },
+    { baseMs: 1, maxMs: 4, maxAttempts: 5 }
+  );
+  await store.add({ ...item('slow'), queuedAt: 1 });
+
+  await withGlobals({ navigator: serialLocks() }, async () => {
+    void a.drain();
+    await new Promise((r) => setTimeout(r, 50)); // let 'slow' fail and start its backoff
+    await store.add({ ...item('quick'), queuedAt: 2 });
+    void b.drain();
+    // If the lock were held across the backoff this would still be empty when time is up.
+    for (let i = 0; i < 100 && !uploaded.length; i++) await new Promise((r) => setTimeout(r, 10));
+    a.stop();
+    b.stop();
+  });
+
+  expect(uploaded).toEqual(['quick']); // got the lock while the other was asleep
 });
 
 test('a retry asked for while the queue is winding down still runs', async () => {

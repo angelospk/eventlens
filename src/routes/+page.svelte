@@ -4,10 +4,8 @@
   import { base } from '$app/paths';
   import { config } from '$lib/config';
   import { today, formatNight } from '$lib/date';
-  import { createQueueStorage, type QueueStorage } from '$lib/idb-store';
-  import { UploadQueue } from '$lib/upload-queue';
-  import { makeR2Uploader, type Stage } from '$lib/r2-client';
-  import { Session } from '$lib/session';
+  import { uploads } from '$lib/uploads.svelte';
+  import type { Stage } from '$lib/r2-client';
   import { fingerprintOf } from '$lib/fingerprint';
   import { diagnose, type Diagnosis } from '$lib/diagnostics';
   import { loadPreference, savePreference, type FormatPreference } from '$lib/image-format';
@@ -17,19 +15,19 @@
   let loggedIn = $state(false);
   let checking = $state(false);
   let loginError = $state('');
-  let items = $state<QueueItem[]>([]);
-  let completed = $state(0);
   let online = $state(true);
-  let struggling = $state(false);
-  let stage = $state<{ id: string; stage: Stage } | null>(null);
+  const items = $derived(uploads.items);
+  const completed = $derived(uploads.completed);
+  const struggling = $derived(uploads.struggling);
+  const stage = $derived(uploads.stage);
+  const ephemeral = $derived(uploads.ephemeral);
+  const activeId = $derived(uploads.activeId);
   let installEvent = $state<{ prompt: () => void } | null>(null);
   let iosInstallHint = $state(false);
   // True when the photographer was let in without the server confirming the passcode.
   // Signing in offline is deliberate, but it must not look like a verified session: a typo
   // would otherwise be discovered only when the first upload fails.
   let unverified = $state(false);
-  // True when the queue lives only in memory because the database would not open.
-  let ephemeral = $state(false);
   // Ticks only while something is uploading, so a wedged attempt turns into an offer of
   // help on its own rather than sitting there looking busy.
   let nowTick = $state(Date.now());
@@ -41,7 +39,6 @@
   // the database while nobody is uploading it — another tab held the queue, or the app was
   // killed mid-attempt — and calling that "uploading" is how six photographs end up looking
   // busy at once when only one ever is.
-  let activeId = $state<string | null>(null);
   const isUploading = (it: QueueItem) => it.status === 'uploading' && it.id === activeId;
   const isStuck = (it: QueueItem) =>
     isUploading(it) && !!it.startedAt && nowTick - it.startedAt > STUCK_AFTER_MS;
@@ -50,11 +47,11 @@
   let doctorRunning = $state(false);
   let doctor = $state<Diagnosis | null>(null);
   let formatPref = $state<FormatPreference>('auto');
-  let queue: UploadQueue;
-  let store: QueueStorage['store'];
-  // A manager's token is accepted here too: same person, and being asked for a second
-  // passcode just to upload is friction with nothing behind it.
-  const session = new Session(config.workerUrl, 'photographer', undefined, ['manager']);
+  // The queue belongs to the app, not to this screen: it keeps running while the manager
+  // page is open, and coming back here must not build a second one.
+  const queue = $derived(uploads.queue!);
+  const store = $derived(uploads.store!);
+  const session = uploads.session;
 
   // One object URL per queued file, revoked as soon as the item leaves the queue so a long
   // night of shooting does not leak hundreds of blobs.
@@ -86,31 +83,23 @@
     thumbs = next;
   }
 
-  async function refresh() {
-    // 'done' rows only exist when storage refused a delete after a successful upload. They
-    // are finished work, so they must not show up as something still waiting.
-    // Sorted the way the queue processes them, so the order on screen is the order the
-    // photographs will actually arrive rather than the database's own key order.
-    const list = (await store.all())
-      .filter((i) => i.status !== 'done')
-      .sort((a, b) => (a.queuedAt ?? 0) - (b.queuedAt ?? 0));
-    syncThumbs(list);
-    items = list;
-    completed = queue?.completed ?? 0;
-    activeId = queue?.activeId ?? null;
-    struggling = queue?.struggling ?? false;
-    const done = queue?.lastDone;
+  // Previews are this screen's business, not the queue's, so they are kept here and
+  // rebuilt whenever the shared list changes.
+  $effect(() => {
+    syncThumbs(uploads.items);
+    const done = uploads.lastDone;
     if (done && done.at !== lastDone?.at) {
       // Exactly one preview is held at a time; the previous one is released here rather
       // than accumulating a night's worth of object URLs.
       if (lastDone) URL.revokeObjectURL(lastDone.url);
       lastDone = { name: done.name, at: done.at, url: URL.createObjectURL(done.file) };
     }
-    if (!items.some((i) => i.id === stage?.id)) stage = null;
     // The first request that gets through exchanges the passcode for a token, which
     // retroactively confirms an offline sign-in.
     if (unverified && session.verified) unverified = false;
-  }
+  });
+
+  const refresh = () => uploads.refresh();
 
   async function runDoctor() {
     doctorRunning = true;
@@ -135,21 +124,12 @@
   }
 
   async function start() {
-    // Falls back to an in-memory queue rather than refusing to accept photographs when the
-    // database will not open. Losing the queue on reload beats not being able to upload.
-    const storage = await createQueueStorage();
-    store = storage.store;
-    ephemeral = storage.ephemeral;
-    const uploader = makeR2Uploader({
-      workerUrl: config.workerUrl,
-      auth: () => session.headers(),
-      onStage: (id, st) => (stage = { id, stage: st })
-    });
-    queue = new UploadQueue(store, uploader, config.retry, refresh);
-    loggedIn = true;
     formatPref = loadPreference();
-    refresh();
-    queue.drain(); // resume anything left from a previous session
+    // Awaited before the screen appears: the queue is opening IndexedDB, and a photographer
+    // quick enough to pick files during that window would otherwise reach a queue that does
+    // not exist yet.
+    await uploads.start();
+    loggedIn = true;
   }
 
   async function login() {
@@ -172,8 +152,9 @@
   }
 
   function logout() {
-    queue?.stop(); // otherwise it keeps retrying with credentials that no longer exist
-    session.signOut();
+    // Stops the queue and drops the credentials: otherwise it keeps retrying with a token
+    // the user has just signed out of.
+    uploads.reset();
     loggedIn = false;
     passcode = '';
     // Drop the rendered state with the session, otherwise the next login flashes the
@@ -182,8 +163,6 @@
     thumbs = {};
     if (lastDone) URL.revokeObjectURL(lastDone.url);
     lastDone = null;
-    items = [];
-    completed = 0;
     pickError = '';
     skipped = '';
     void import('$lib/processor').then((m) => m.disposeProcessor());
@@ -192,7 +171,7 @@
   async function onPick(e: Event) {
     const input = e.target as HTMLInputElement;
     const files = input.files;
-    if (!files) return;
+    if (!files || !uploads.ready) return;
     pickError = '';
     eventDate = today(); // the night may have rolled over since the app was opened
     const pickedAt = Date.now();
