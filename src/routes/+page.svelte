@@ -482,6 +482,14 @@
           μόλις γυρίσει το σήμα. Μην κλείσεις την εφαρμογή.
         </span>
       </div>
+    {:else if uploads.storageFailing}
+      <div class="banner banner-warn">
+        <strong>Η αποθήκευση του κινητού δεν δέχεται εγγραφές</strong>
+        <span>
+          Κάποιες φωτογραφίες σταμάτησαν γι᾽ αυτό, όχι λόγω δικτύου. Κλείσε και ξανάνοιξε
+          την εφαρμογή· αν επιμείνει, ελευθέρωσε χώρο στο κινητό.
+        </span>
+      </div>
     {:else if uploads.blocked}
       <div class="banner banner-warn">
         <strong>Η εφαρμογή είναι ανοιχτή και αλλού</strong>

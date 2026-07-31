@@ -85,6 +85,39 @@ function tx<T>(
   });
 }
 
+/**
+ * How a photograph is stored, as opposed to how it is used.
+ *
+ * The bytes go in as an ArrayBuffer, never as a Blob. A Blob in IndexedDB is a reference to
+ * a file the browser keeps beside the database, and on iOS that file goes away while the
+ * row stays: every read of it then throws "The object can not be found here." Worse, so
+ * does every *write* of the row, because updating it means cloning the dead Blob along with
+ * it — which is how one unreadable photograph turned into a queue that could not record
+ * that anything had failed, retried forever, and never counted an attempt.
+ *
+ * An ArrayBuffer is plain data. It is copied into the database and has nothing behind it
+ * to lose.
+ */
+type Row = Omit<QueueItem, 'file'> & {
+  data?: ArrayBuffer;
+  fileType?: string;
+  /** Written by versions that stored the Blob directly. Read, never written. */
+  file?: Blob;
+};
+
+async function toRow(item: QueueItem): Promise<Row> {
+  const { file, ...rest } = item;
+  return { ...rest, data: await file.arrayBuffer(), fileType: file.type || 'image/jpeg' };
+}
+
+function fromRow(row: Row): QueueItem {
+  const { data, fileType, file, ...rest } = row;
+  return {
+    ...(rest as Omit<QueueItem, 'file'>),
+    file: data ? new Blob([data], { type: fileType || 'image/jpeg' }) : (file as Blob)
+  };
+}
+
 export class IdbStore implements QueueStore {
   private dbp: Promise<IDBDatabase>;
   constructor(dbName = 'eventlens-queue') {
@@ -94,7 +127,14 @@ export class IdbStore implements QueueStore {
     this.dbp.catch(() => {});
   }
 
-  async add(item: QueueItem) { await tx(await this.dbp, 'readwrite', (s) => s.put(item)); }
+  async add(item: QueueItem) {
+    // Read here, while the photograph has just come from the picker and is certainly
+    // readable — not on the way out, hours later, when there is nothing to be done about
+    // it. A failure now is reported at the moment of choosing, which is the only moment
+    // the photographer can act on it.
+    const row = await toRow(item);
+    await tx(await this.dbp, 'readwrite', (s) => s.put(row));
+  }
 
   // Read-modify-write inside ONE readwrite transaction to avoid lost updates
   // (e.g. processor writing avif/bytes racing with retry writing status/attempts).
@@ -105,9 +145,13 @@ export class IdbStore implements QueueStore {
       const s = t.objectStore(STORE);
       const getReq = s.get(id);
       getReq.onsuccess = () => {
-        const cur = getReq.result as QueueItem | undefined;
+        const cur = getReq.result as Row | undefined;
         if (!cur) return; // item already removed
-        s.put({ ...cur, ...patch });
+        // `file` is never part of a patch — status, attempts and timings are. Keeping the
+        // stored bytes exactly as they are means an update rewrites only small plain
+        // values, and can no longer be taken down by the photograph it happens to carry.
+        const { file: _ignored, ...rest } = patch as Partial<QueueItem>;
+        s.put({ ...cur, ...rest });
       };
       t.oncomplete = () => resolve();
       t.onerror = () => reject(t.error);
@@ -117,7 +161,8 @@ export class IdbStore implements QueueStore {
   async remove(id: string) { await tx(await this.dbp, 'readwrite', (s) => s.delete(id)); }
 
   async all() {
-    return tx<QueueItem[]>(await this.dbp, 'readonly', (s) => s.getAll() as IDBRequest<QueueItem[]>);
+    const rows = await tx<Row[]>(await this.dbp, 'readonly', (s) => s.getAll() as IDBRequest<Row[]>);
+    return rows.map(fromRow);
   }
 
   /** Records that this exact file made it to the server. */

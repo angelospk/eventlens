@@ -667,3 +667,32 @@ test('a storage failure that aborts is not mistaken for the queue being stopped'
     expect(queue.drain()).rejects.toThrow('the transaction was aborted');
   });
 });
+
+test('a queue that cannot be written to gives up instead of retrying forever', async () => {
+  // Seen in the field: the store accepted the row and then refused every update to it, so
+  // each attempt failed, the failure could not be recorded, the attempt count never rose,
+  // nothing ever became terminal, and the same photograph was retried ninety times.
+  const store = new MemStore();
+  let refusals = 0;
+  const refusing = {
+    add: (it: QueueItem) => store.add(it),
+    all: () => store.all(),
+    remove: (id: string) => store.remove(id),
+    async update(): Promise<void> {
+      refusals++;
+      throw new Error('The object can not be found here.');
+    }
+  };
+  const queue = new UploadQueue(refusing, { async run() {} }, { baseMs: 1, maxMs: 4, maxAttempts: 5 });
+  await store.add(item('wedged'));
+
+  for (let i = 0; i < 6; i++) await queue.drain();
+
+  // Three refusals and then left alone, rather than one more on every drain forever.
+  expect(refusals).toBe(3);
+  expect(queue.storageFailing).toBe(true);
+
+  // Asking again by hand is still allowed: the photographer may have freed space.
+  await queue.retryMany(['wedged']);
+  expect(refusals).toBeGreaterThan(3);
+});

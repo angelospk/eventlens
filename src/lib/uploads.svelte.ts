@@ -26,6 +26,8 @@ class Uploads {
   struggling = $state(false);
   /** The queue is alive but another window is holding the lock. */
   blocked = $state(false);
+  /** The device's storage refused to record a photograph's progress. */
+  storageFailing = $state(false);
   ephemeral = $state(false);
   /** The photograph actually in flight, as opposed to one a stale row merely claims is. */
   activeId = $state<string | null>(null);
@@ -126,6 +128,7 @@ class Uploads {
     this.completed = this.queue?.completed ?? 0;
     this.struggling = this.queue?.struggling ?? false;
     this.blocked = this.queue?.blocked ?? false;
+    this.storageFailing = this.queue?.storageFailing ?? false;
     this.activeId = this.queue?.activeId ?? null;
     this.lastDone = this.queue?.lastDone ?? null;
     if (!this.items.some((i) => i.id === this.stage?.id)) this.stage = null;
@@ -148,6 +151,7 @@ class Uploads {
     this.completed = 0;
     this.struggling = false;
     this.blocked = false;
+    this.storageFailing = false;
     this.stage = null;
     this.activeId = null;
     this.lastDone = null;

@@ -35,6 +35,8 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const LOCK_WARN_MS = 15_000;
 /** The same, for a storage operation that has gone quiet rather than failed. */
 const STALL_WARN_MS = 10_000;
+/** Refusals to record a photograph's progress before it is left alone for this session. */
+const WRITE_GIVE_UP = 3;
 
 /**
  * Notes in the log that something has taken suspiciously long, and stops watching when it
@@ -73,6 +75,10 @@ export class UploadQueue {
   private _lastDone: { name: string; at: number; file: Blob } | null = null;
   /** Set while the lock has been out of reach long enough that it needs explaining. */
   private _blocked = false;
+  // How many times in a row the store refused to record this photograph's progress, and
+  // the ones it has refused often enough to stop asking about.
+  private unwritable = new Map<string, number>();
+  private dead = new Set<string>();
   constructor(
     private store: QueueStore,
     private uploader: Uploader,
@@ -110,6 +116,16 @@ export class UploadQueue {
    * from the outside — nothing moves, nothing errors — so it has to be said out loud.
    */
   get blocked() { return this._blocked; }
+
+  /**
+   * True once a photograph has been abandoned because the queue could not be written to.
+   *
+   * A store that accepts a row and then refuses every update to it is the worst shape this
+   * can take: each attempt fails, the failure cannot be recorded, the attempt count never
+   * rises, so nothing ever becomes terminal and the same photographs are retried until the
+   * battery goes. Seen in the field on an iPhone, ninety attempts deep.
+   */
+  get storageFailing() { return this.dead.size > 0; }
 
   /**
    * Adds a photograph unless it is already here or already sent.
@@ -154,6 +170,10 @@ export class UploadQueue {
    */
   async retryMany(ids: string[]) {
     for (const id of ids) {
+      // Asking again is asking again, including of a store that refused before: the
+      // photographer may well have just freed space or restarted the app.
+      this.dead.delete(id);
+      this.unwritable.delete(id);
       const controller = this.inFlight.get(id);
       if (controller) {
         // Disowned *before* the abort lands. An attempt only writes its outcome while it
@@ -369,7 +389,7 @@ export class UploadQueue {
           settled();
         }
         const items = all
-          .filter((i) => isRunnable(i, this.retry.maxAttempts) && !skip.has(i.id))
+          .filter((i) => isRunnable(i, this.retry.maxAttempts) && !skip.has(i.id) && !this.dead.has(i.id))
           // Fewest attempts first, then oldest.
           //
           // Plain oldest-first means one troublesome photograph, an enormous file or one
@@ -398,7 +418,8 @@ export class UploadQueue {
             ).length;
             const why = [
               exhausted ? `out of attempts=${exhausted}` : '',
-              skip.size ? `unwritable=${skip.size}` : ''
+              skip.size ? `unwritable=${skip.size}` : '',
+              this.dead.size ? `abandoned=${this.dead.size}` : ''
             ].filter(Boolean).join(' ');
             log('queue', `nothing to run · ${shape}${why ? ` · ${why}` : ''}`);
           }
@@ -409,8 +430,16 @@ export class UploadQueue {
         const ready = items.find((i) => !i.nextAttemptAt || i.nextAttemptAt <= now);
         if (ready) {
           if (!(await this.process(ready))) {
+            const n = (this.unwritable.get(ready.id) ?? 0) + 1;
+            this.unwritable.set(ready.id, n);
             log('queue', `${ready.id.slice(0, 8)} ${ready.originalName}: storage refused the write`);
+            if (n >= WRITE_GIVE_UP) {
+              this.dead.add(ready.id);
+              log('queue', `${ready.id.slice(0, 8)} abandoned: the queue cannot be written to`);
+            }
             skip.add(ready.id);
+          } else {
+            this.unwritable.delete(ready.id);
           }
           return 0;
         }
