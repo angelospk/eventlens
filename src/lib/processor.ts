@@ -42,9 +42,14 @@ function ensureWorker(): Worker {
       const thumb = res.thumb ? new Blob([res.thumb], { type: res.mime }) : undefined;
       entry.resolve({ blob, thumb, mime: res.mime, width: res.width, height: res.height, bytes: blob.size });
     } else {
-      // A processing failure is deterministic: the same file will fail the same way on
-      // every retry, so it must not ride the network backoff ladder.
-      entry.reject(new NonRetryableError(`Η φωτογραφία δεν μπόρεσε να επεξεργαστεί: ${res.error}`, 'process_failed'));
+      // A processing failure is normally deterministic — the same file fails the same way
+      // every time — so it must not ride the network backoff ladder. The exception is the
+      // decoder or encoder failing to download, which says nothing about the photograph.
+      entry.reject(
+        res.retryable
+          ? new Error(res.error)
+          : new NonRetryableError(`Η φωτογραφία δεν μπόρεσε να επεξεργαστεί: ${res.error}`, 'process_failed')
+      );
     }
   };
   worker.onerror = (e) => {

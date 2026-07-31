@@ -102,9 +102,18 @@ test('items without a fingerprint are always accepted', async () => {
 
 test('the fingerprint is the file identity, not its contents', () => {
   const f = new File(['abc'], 'DSC_1234.JPG', { lastModified: 1_700_000_000_000 });
-  expect(fingerprintOf(f)).toBe('DSC_1234.JPG|3|1700000000000');
+  expect(fingerprintOf(f)).toBe('DSC_1234.JPG|3');
 
   // Same bytes, different file: two separate photographs as far as the picker is concerned.
   const other = new File(['abc'], 'copy.JPG', { lastModified: 1_700_000_000_000 });
   expect(fingerprintOf(other)).not.toBe(fingerprintOf(f));
+});
+
+test('the same photograph picked twice is recognised even after the picker re-exports it', () => {
+  // The iPhone picker hands over a fresh copy each time, stamped with the moment of the
+  // export. Including that time made every re-pick look like a photograph never seen
+  // before, so the night went up twice.
+  const first = new File(['abc'], 'IMG_1542.jpeg', { lastModified: 1_700_000_000_000 });
+  const again = new File(['abc'], 'IMG_1542.jpeg', { lastModified: 1_800_000_000_000 });
+  expect(fingerprintOf(again)).toBe(fingerprintOf(first));
 });

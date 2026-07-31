@@ -4,6 +4,7 @@
 	import { base } from '$app/paths';
 	import { page } from '$app/state';
 	import { uploads } from '$lib/uploads.svelte';
+	import { log, flushNow, deviceLine } from '$lib/log';
 	import '../app.css';
 	import favicon from '$lib/assets/favicon.svg';
 
@@ -37,11 +38,41 @@
 	// Registered by hand on purpose: SvelteKit 2 only *updates* an already-registered
 	// worker, it does not register one, so without this the app has no offline mode at all.
 	onMount(() => {
+		log('app', `opened · ${deviceLine()}`);
+
 		// Started here rather than per page, so photographs left over from a previous session
 		// resume no matter which screen the app was opened on.
 		if (uploads.session.restore()) uploads.start();
 
-		if (dev || !('serviceWorker' in navigator)) return;
+		// The context a failure needs: whether the phone thought it was online, whether the
+		// app was in the foreground, and anything that threw where nobody was looking.
+		const onOnline = () => log('app', 'network came back');
+		const onOffline = () => log('app', 'network went away');
+		const onHide = () => {
+			log('app', 'backgrounded or closing');
+			flushNow(); // the last lines are the ones that explain a crash
+		};
+		const onShow = () => log('app', 'back in the foreground');
+		const onError = (e: ErrorEvent) => log('app', `ERROR ${e.message}`);
+		const onReject = (e: PromiseRejectionEvent) =>
+			log('app', `UNHANDLED ${(e.reason as Error)?.message ?? e.reason}`);
+
+		window.addEventListener('online', onOnline);
+		window.addEventListener('offline', onOffline);
+		window.addEventListener('pagehide', onHide);
+		window.addEventListener('pageshow', onShow);
+		window.addEventListener('error', onError);
+		window.addEventListener('unhandledrejection', onReject);
+		const offListeners = () => {
+			window.removeEventListener('online', onOnline);
+			window.removeEventListener('offline', onOffline);
+			window.removeEventListener('pagehide', onHide);
+			window.removeEventListener('pageshow', onShow);
+			window.removeEventListener('error', onError);
+			window.removeEventListener('unhandledrejection', onReject);
+		};
+
+		if (dev || !('serviceWorker' in navigator)) return offListeners;
 
 		navigator.serviceWorker.addEventListener('controllerchange', () => {
 			// The new worker took over. One reload and the page is running the new code.
@@ -70,6 +101,8 @@
 			.catch(() => {
 				// No service worker means no offline mode, which is worth nothing breaking over.
 			});
+
+		return offListeners;
 	});
 </script>
 

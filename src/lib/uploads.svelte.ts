@@ -4,6 +4,7 @@ import { UploadQueue, type QueueStore } from './upload-queue';
 import { makeR2Uploader, type Stage } from './r2-client';
 import { Session } from './session';
 import type { QueueItem } from './types';
+import { log } from './log';
 
 /**
  * The one upload queue the whole app shares.
@@ -40,17 +41,53 @@ class Uploads {
   readonly session = new Session(config.workerUrl, 'photographer', undefined, ['manager']);
 
   private starting: Promise<void> | null = null;
+  /**
+   * Bumped whenever the queue is torn down, so a build still opening the database when
+   * someone signs out cannot come back afterwards and install a queue for a session that
+   * no longer exists — which would then upload with credentials that were just dropped.
+   */
+  private generation = 0;
+  private watching = false;
+
+  /**
+   * The two moments always worth retrying, wired here rather than on the upload screen:
+   * the queue runs under every route now, and a photographer looking at the manager page
+   * when the signal comes back should not have to wait out a backoff set during the outage.
+   */
+  private watch() {
+    if (this.watching || typeof window === 'undefined') return;
+    this.watching = true;
+    const resume = (why: string) => {
+      log('app', `resuming uploads: ${why}`);
+      void this.queue?.resume();
+    };
+    window.addEventListener('online', () => resume('the network came back'));
+    // Mobile browsers freeze timers while a tab is hidden, so a backoff started before the
+    // app was backgrounded can still be "waiting" long after it should have fired.
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'visible') resume('back in the foreground');
+    });
+  }
 
   /** Idempotent, and safe to call from every page on every navigation. */
   start(): Promise<void> {
-    if (!this.starting) this.starting = this.build();
+    if (!this.starting) {
+      this.starting = this.build().catch((e) => {
+        // Not cached as a failure: a queue that could not be opened once must be openable
+        // on the next attempt, or one bad moment locks the photographer out for good.
+        this.starting = null;
+        throw e;
+      });
+    }
     return this.starting;
   }
 
   private async build() {
+    const mine = this.generation;
     // Falls back to an in-memory queue rather than refusing to accept photographs when the
     // database will not open. Losing the queue on reload beats not being able to upload.
     const storage = await createQueueStorage();
+    if (mine !== this.generation) return; // signed out while the database was opening
     this.store = storage.store;
     this.ephemeral = storage.ephemeral;
     const uploader = makeR2Uploader({
@@ -58,10 +95,13 @@ class Uploads {
       auth: () => this.session.headers(),
       onStage: (id, stage) => (this.stage = { id, stage })
     });
-    this.queue = new UploadQueue(this.store, uploader, config.retry, () => this.refresh());
+    const queue = new UploadQueue(this.store, uploader, config.retry, () => this.refresh());
+    this.queue = queue;
     this.ready = true;
     await this.refresh();
-    this.queue.drain(); // resume anything left from a previous session
+    if (mine !== this.generation) return;
+    this.watch();
+    queue.drain(); // resume anything left from a previous session
   }
 
   async refresh() {
@@ -86,6 +126,7 @@ class Uploads {
    * sign-in gets `start()`'s already-resolved promise back and never resumes anything.
    */
   reset() {
+    this.generation++;
     this.queue?.stop();
     this.session.signOut();
     this.queue = null;

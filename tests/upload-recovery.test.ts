@@ -537,8 +537,10 @@ function serialLocks() {
   let chain: Promise<unknown> = Promise.resolve();
   return {
     locks: {
-      request: (_n: string, cb: () => Promise<unknown>) => {
-        const next = chain.then(cb);
+      // Same shape as the real one: (name, options, callback).
+      request: (_n: string, opts: any, cb?: () => Promise<unknown>) => {
+        const run = (typeof opts === 'function' ? opts : cb) as () => Promise<unknown>;
+        const next = chain.then(run);
         chain = next.catch(() => {});
         return next;
       }

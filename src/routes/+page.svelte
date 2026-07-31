@@ -9,6 +9,7 @@
   import { fingerprintOf } from '$lib/fingerprint';
   import { diagnose, type Diagnosis } from '$lib/diagnostics';
   import { loadPreference, savePreference, type FormatPreference } from '$lib/image-format';
+  import { dump, entries, clearLog, onLog, log } from '$lib/log';
   import type { QueueItem } from '$lib/types';
 
   let passcode = $state('');
@@ -44,6 +45,10 @@
     isUploading(it) && !!it.startedAt && nowTick - it.startedAt > STUCK_AFTER_MS;
   const stuckItems = $derived(items.filter(isStuck));
   let doctorOpen = $state(false);
+  // The record of what actually happened, kept so a failure in a field can be looked at
+  // afterwards instead of described from memory.
+  let logLines = $state<string[]>([]);
+  let logNote = $state('');
   let doctorRunning = $state(false);
   let doctor = $state<Diagnosis | null>(null);
   let formatPref = $state<FormatPreference>('auto');
@@ -72,9 +77,14 @@
   const pendingCount = $derived(items.filter((i) => i.status !== 'error').length);
   const failed = $derived(items.filter((i) => i.status === 'error'));
 
+  // Previews are made for the top of the queue only. Each one holds a whole multi-megapixel
+  // photograph open in memory to draw a 56-pixel square, and a burst of fifty is enough for
+  // iOS to kill the tab — which then reopens on the same fifty and does it again.
+  const PREVIEW_LIMIT = 12;
+
   function syncThumbs(list: QueueItem[]) {
     const next: Record<string, string> = {};
-    for (const it of list) {
+    for (const it of list.slice(0, PREVIEW_LIMIT)) {
       next[it.id] = thumbs[it.id] ?? URL.createObjectURL(it.file);
     }
     for (const [id, url] of Object.entries(thumbs)) {
@@ -107,9 +117,52 @@
 
   const refresh = () => uploads.refresh();
 
+  const readLog = () =>
+    (logLines = entries()
+      .slice(-120)
+      .reverse()
+      .map((e) => {
+        const d = new Date(e.t);
+        const p = (n: number) => String(n).padStart(2, '0');
+        return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())} ${e.msg}`;
+      }));
+
+  async function shareLog() {
+    const text = dump();
+    logNote = '';
+    // Sharing beats copying on a phone: it opens Messages or Mail with the text already in
+    // it, which is the whole journey rather than the first step of it.
+    try {
+      const share = (navigator as unknown as { share?: (d: { title: string; text: string }) => Promise<void> }).share;
+      if (share) {
+        await share.call(navigator, { title: 'EventLens log', text });
+        return;
+      }
+    } catch {
+      // Cancelled, or refused. Fall through to the clipboard.
+    }
+    try {
+      await navigator.clipboard.writeText(text);
+      logNote = 'Αντιγράφηκε.';
+    } catch {
+      logNote = 'Δεν έγινε αντιγραφή. Κράτα screenshot.';
+    }
+  }
+
+  function downloadLog() {
+    const url = URL.createObjectURL(new Blob([dump()], { type: 'text/plain' }));
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `eventlens-log-${new Date().toISOString().slice(0, 16).replace(/[:T]/g, '')}.txt`;
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(url), 5000);
+  }
+
   async function runDoctor() {
     doctorRunning = true;
     doctorOpen = true;
+    readLog();
+    onLog(readLog);
     try {
       doctor = await diagnose({
         workerUrl: config.workerUrl,
@@ -131,10 +184,19 @@
 
   async function start() {
     formatPref = loadPreference();
-    // Awaited before the screen appears: the queue is opening IndexedDB, and a photographer
-    // quick enough to pick files during that window would otherwise reach a queue that does
-    // not exist yet.
-    await uploads.start();
+    try {
+      // Awaited before the screen appears: the queue is opening IndexedDB, and a
+      // photographer quick enough to pick files during that window would otherwise reach a
+      // queue that does not exist yet.
+      await uploads.start();
+    } catch (e) {
+      // Said out loud rather than swallowed. A silent failure here looks exactly like the
+      // password being wrong, and the photographer retypes it all night.
+      const why = e instanceof Error ? e.message : String(e);
+      log('app', `could not open the queue: ${why}`);
+      loginError = `Δεν άνοιξε η ουρά ανεβάσματος. ${why}`;
+      return;
+    }
     loggedIn = true;
   }
 
@@ -151,7 +213,11 @@
       // exchanged for a token on the first request that gets through.
       unverified = result === 'offline';
       passcode = '';
-      start();
+      await start();
+      // Anything that failed on the old, expired credentials deserves another go now that
+      // there are new ones — otherwise signing back in leaves a screen full of failures
+      // that the photographer has to notice and clear by hand.
+      if (loggedIn) void uploads.queue?.retryAll();
     } finally {
       checking = false;
     }
@@ -255,6 +321,16 @@
   }
 
   async function cancelStuck() {
+    // Asked for out loud. "Άκυρο" reads as "stop waiting", but the row and the only copy of
+    // the photograph go with it, and a merely slow upload passes the 25-second mark all the
+    // time on a bad link.
+    const n = stuckItems.length;
+    const sure = confirm(
+      n === 1
+        ? 'Η φωτογραφία θα διαγραφεί από την ουρά και δεν θα σταλεί. Σίγουρα;'
+        : `${n} φωτογραφίες θα διαγραφούν από την ουρά και δεν θα σταλούν. Σίγουρα;`
+    );
+    if (!sure) return;
     for (const id of stuckItems.map((i) => i.id)) await queue.cancel(id);
   }
 
@@ -333,6 +409,7 @@
 
   onDestroy(() => {
     for (const url of Object.values(thumbs)) URL.revokeObjectURL(url);
+    onLog(null);
   });
 </script>
 
@@ -461,6 +538,20 @@
           <button class="btn btn-sm" style="margin-top:.75rem" onclick={runDoctor}>Ξανά</button>
         {/if}
 
+        <div class="doctor-log">
+          <span class="setting-label">Καταγραφή ({entries().length} γραμμές)</span>
+          <p class="hint">
+            Ό,τι έκανε το ανέβασμα, με ώρες. Κρατιέται ακόμα κι αν κλείσει η εφαρμογή.
+          </p>
+          <div class="log-actions">
+            <button class="btn btn-sm" onclick={shareLog}>Στείλε την καταγραφή</button>
+            <button class="btn btn-sm" onclick={downloadLog}>Αποθήκευση</button>
+            <button class="btn btn-sm btn-danger" onclick={() => { clearLog(); readLog(); }}>Καθάρισμα</button>
+          </div>
+          {#if logNote}<p class="hint">{logNote}</p>{/if}
+          <pre class="log-view">{logLines.join('\n') || 'Τίποτα ακόμα.'}</pre>
+        </div>
+
         <div class="doctor-format">
           <span class="setting-label">Μορφή αρχείων</span>
           <div class="seg">
@@ -564,9 +655,11 @@
           <li class="row">
             {#if unreadable[it.id]}
               <div class="thumb thumb-gone" aria-hidden="true">!</div>
-            {:else}
-              <img class="thumb" src={thumbs[it.id]} alt=""
+            {:else if thumbs[it.id]}
+              <img class="thumb" src={thumbs[it.id]} alt="" loading="lazy"
                    onerror={() => (unreadable = { ...unreadable, [it.id]: true })} />
+            {:else}
+              <div class="thumb thumb-placeholder" aria-hidden="true"></div>
             {/if}
             <div class="meta">
               <span class="name">{it.originalName}</span>
@@ -597,7 +690,10 @@
             {:else if isStuck(it)}
               <div class="row-actions">
                 <button class="btn btn-sm" onclick={() => queue.retryItem(it.id)}>Ξανά</button>
-                <button class="btn btn-sm btn-danger" onclick={() => queue.cancel(it.id)}>Άκυρο</button>
+                <button class="btn btn-sm btn-danger"
+                        onclick={() => confirm('Η φωτογραφία θα διαγραφεί και δεν θα σταλεί. Σίγουρα;') && queue.cancel(it.id)}>
+                  Άκυρο
+                </button>
               </div>
             {/if}
           </li>
@@ -608,6 +704,11 @@
 </div>
 
 <style>
+  .thumb-placeholder {
+    background: var(--surface-1, #101119);
+    border: 1px solid var(--line);
+  }
+
   .thumb-gone {
     display: flex;
     align-items: center;
@@ -689,6 +790,34 @@
 
   .doctor-list strong {
     font-size: 0.9rem;
+  }
+
+  .doctor-log {
+    margin-top: 1rem;
+    padding-top: 1rem;
+    border-top: 1px solid var(--line);
+  }
+
+  .log-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+    margin: 0.6rem 0;
+  }
+
+  .log-view {
+    max-height: 40vh;
+    overflow: auto;
+    margin: 0;
+    padding: 0.6rem;
+    border-radius: 0.6rem;
+    background: var(--surface-1, #101119);
+    border: 1px solid var(--line);
+    color: var(--muted);
+    font-size: 0.7rem;
+    line-height: 1.45;
+    white-space: pre-wrap;
+    word-break: break-word;
   }
 
   .doctor-format {

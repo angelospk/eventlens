@@ -1,5 +1,6 @@
 import type { QueueItem } from './types';
 import { describeError, isAlreadyUploaded, isNetworkError, isNonRetryable } from './errors';
+import { log } from './log';
 
 export interface QueueStore {
   add(item: QueueItem): Promise<void>;
@@ -51,6 +52,8 @@ export class UploadQueue {
   // moment the device reports a connection again.
   private wake: (() => void) | null = null;
   private stopped = false;
+  /** Set only while waiting for the lock, so a stop can call the wait off. */
+  private locking: AbortController | null = null;
   private _completed = 0;
   private _lastDone: { name: string; at: number; file: Blob } | null = null;
   constructor(
@@ -95,11 +98,16 @@ export class UploadQueue {
     if (item.fingerprint) {
       const queued = await this.store.all();
       if (queued.some((i) => i.fingerprint === item.fingerprint && i.status !== 'done')) {
+        log('queue', `skipped ${item.originalName}: already in the queue`);
         return 'duplicate';
       }
-      if (await this.store.wasSent?.(item.fingerprint)) return 'duplicate';
+      if (await this.store.wasSent?.(item.fingerprint)) {
+        log('queue', `skipped ${item.originalName}: already sent`);
+        return 'duplicate';
+      }
     }
     await this.store.add(item);
+    log('queue', `queued ${item.id.slice(0, 8)} ${item.originalName}`);
     this.onChange();
     return 'queued';
   }
@@ -137,6 +145,7 @@ export class UploadQueue {
         // Row is gone or the store is unavailable; nothing to retry.
       }
     }
+    log('queue', `retry requested for ${ids.length}`);
     this.onChange();
     // The drain may be asleep on a backoff it set before the reset. Without this the
     // photographer presses "try again" and watches nothing happen for up to half a minute.
@@ -176,10 +185,21 @@ export class UploadQueue {
    * a holder that then wakes up and carries on. Locks are released when a document goes
    * away, so waiting is both correct and sufficient.
    */
-  private async withLock<T>(fn: () => Promise<T>): Promise<T> {
+  private async withLock<T>(fn: () => Promise<T>): Promise<T | null> {
     const locks = (globalThis as any).navigator?.locks;
     if (!locks?.request) return fn();
-    return locks.request('eventlens-upload', fn) as Promise<T>;
+    // The wait is abortable so `stop()` can end it. Without that, a queue waiting on a
+    // lock another window holds never settles its drain, `running` stays true for good,
+    // and every later request to upload quietly defers to a loop that will never run.
+    this.locking = new AbortController();
+    try {
+      return (await locks.request('eventlens-upload', { signal: this.locking.signal }, fn)) as T;
+    } catch (e) {
+      if ((e as Error)?.name === 'AbortError') return null;
+      throw e;
+    } finally {
+      this.locking = null;
+    }
   }
 
   /**
@@ -193,6 +213,10 @@ export class UploadQueue {
     // Set unconditionally: a request made while a loop is running is honoured by that loop's
     // next turn, and a request made as one is finishing starts a new one.
     this.dirty = true;
+    // A loop asleep on someone else's backoff has to be told, or a freshly picked
+    // photograph waits out a wait that has nothing to do with it — up to half a minute of
+    // the picker closing and nothing appearing to happen.
+    this.wake?.();
     if (!this.running) {
       // Claimed synchronously. `loop` does not reach its body until the lock is acquired, so
       // claiming in there would let two calls in the same tick both start a loop.
@@ -237,7 +261,10 @@ export class UploadQueue {
       for (const i of stale) {
         await this.store.update(i.id, { status: 'pending', startedAt: undefined });
       }
-      if (stale.length) this.onChange();
+      if (stale.length) {
+        log('queue', `recovered ${stale.length} interrupted by a close or crash`);
+        this.onChange();
+      }
     } catch {
       // Not worth failing the drain over; the rows are retried regardless.
     }
@@ -282,10 +309,13 @@ export class UploadQueue {
         // Everything runnable is still in backoff: report how long, and wait for it with
         // the lock released. (A newly-enqueued item has no nextAttemptAt, so it would
         // have been 'ready'.)
-        const soonest = Math.min(...items.map((i) => i.nextAttemptAt as number));
-        return Math.max(0, soonest - now);
+        // Only real timestamps: a corrupt row with a NaN in it would otherwise poison the
+        // minimum and turn the wait into a busy loop.
+        const times = items.map((i) => i.nextAttemptAt as number).filter(Number.isFinite);
+        if (!times.length) return 250;
+        return Math.max(0, Math.min(...times) - now);
       });
-      if (wait < 0) return;
+      if (wait === null || wait < 0) return; // stopped, or nothing left to do
       if (wait > 0) await this.waitUntil(wait);
     }
   }
@@ -325,6 +355,7 @@ export class UploadQueue {
   stop() {
     this.stopped = true;
     this.wake?.();
+    this.locking?.abort();
   }
 
   async resume() {
@@ -356,12 +387,14 @@ export class UploadQueue {
     try {
       await this.uploader.run(it, controller.signal);
       this.netFails = 0;
+      log('queue', `done ${it.id.slice(0, 8)} ${it.originalName} on try ${tries}`);
       await this.finish(it.id, it.fingerprint, it);
       return true;
     } catch (e) {
       // The server already has it: count it as done rather than scaring the photographer
       // with a failure for a photo that is actually up.
       if (isAlreadyUploaded(e)) {
+        log('queue', `${it.id.slice(0, 8)} was already on the server`);
         this.netFails = 0;
         await this.finish(it.id, it.fingerprint, it);
         return true;
@@ -380,6 +413,12 @@ export class UploadQueue {
       // 'error' instead of spending the whole backoff ladder rediscovering that.
       const terminal = isNonRetryable(e) || attempts >= this.retry.maxAttempts;
       const backoff = Math.min(this.retry.maxMs, this.retry.baseMs * 2 ** Math.min(tries - 1, 20));
+      log(
+        'queue',
+        `FAILED ${it.id.slice(0, 8)} ${it.originalName} try ${tries} ` +
+          `${networky ? 'network' : 'server/file'}${terminal ? ' GIVING UP' : ` retry in ${Math.round(backoff / 1000)}s`}: ` +
+          (e instanceof Error ? e.message : String(e))
+      );
       try {
         await this.store.update(it.id, {
           attempts,
@@ -412,6 +451,7 @@ export class UploadQueue {
    * Used for something that is clearly not going to arrive, so the rest can move.
    */
   async cancel(id: string) {
+    log('queue', `cancelled ${id.slice(0, 8)}`);
     const controller = this.inFlight.get(id);
     this.inFlight.delete(id);
     controller?.abort(new Error('cancelled'));

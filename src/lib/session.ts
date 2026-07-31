@@ -108,7 +108,18 @@ export class Session {
     for (const role of [this.role, ...this.alsoAccept]) {
       const store = this.storeFor(role);
       if (!store) continue;
-      const raw = safeGet(store, KEY(role));
+      // A manager token issued before these moved stores is still perfectly good, and
+      // making the manager type the passcode once more for no reason is exactly the
+      // friction this change was meant to remove.
+      let raw = safeGet(store, KEY(role));
+      if (!raw && hasStorage()) {
+        const legacy = safeGet(sessionStorage, KEY(role));
+        if (legacy) {
+          raw = legacy;
+          safeSet(store, KEY(role), legacy);
+          safeRemove(sessionStorage, KEY(role));
+        }
+      }
       if (!raw) continue;
       try {
         const { token, expiresAt } = JSON.parse(raw) as { token: string; expiresAt: number };

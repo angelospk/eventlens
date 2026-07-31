@@ -34,7 +34,10 @@ export type ProcessResponse =
       height: number;
       mime: string;
     }
-  | { id: string; ok: false; error: string };
+  // `retryable` separates "this file cannot be processed" from "the code needed to process
+  // it could not be fetched". The second is a network failure wearing the first's clothes,
+  // and treating it as a broken photograph retires a perfectly good one permanently.
+  | { id: string; ok: false; error: string; retryable?: boolean };
 
 /**
  * Encodes the finished frame, preferring the browser's own encoder.
@@ -70,7 +73,10 @@ async function encodeImage(
     // Safari lands here. The format was already signed as WebP precisely because the probe
     // confirmed this path exists, so failing over to JPEG would send bytes that do not
     // match the signature.
-    const { default: encodeWebp } = await import('@jsquash/webp/encode');
+    const { default: encodeWebp } = await loadable(
+      () => import('@jsquash/webp/encode'),
+      'WebP encoder'
+    );
     const buf = await encodeWebp(ctx.getImageData(0, 0, width, height), {
       quality,
       // Encoder effort, 0-6. Four is the point where more time stops buying much size.
@@ -156,11 +162,30 @@ function cornerXY(corner: Corner, W: number, H: number, lw: number, lh: number, 
  * The HEIC decoder is a three megabyte WebAssembly bundle, so it is imported only after a
  * decode has actually failed. A night of JPEGs never pays for it.
  */
+/**
+ * A marker for "the module itself would not load", which on a phone in a field is almost
+ * always the signal dropping mid-fetch rather than anything wrong with the photograph.
+ */
+class ChunkLoadError extends Error {
+  readonly retryable = true;
+  constructor(what: string, cause: unknown) {
+    super(`${what} δεν κατέβηκε: ${cause instanceof Error ? cause.message : cause}`);
+  }
+}
+
+async function loadable<T>(load: () => Promise<T>, what: string): Promise<T> {
+  try {
+    return await load();
+  } catch (e) {
+    throw new ChunkLoadError(what, e);
+  }
+}
+
 async function decode(blob: Blob): Promise<ImageBitmap> {
   try {
     return await createImageBitmap(blob);
   } catch (nativeError) {
-    const { isHeic, heicTo } = await import('heic-to/next');
+    const { isHeic, heicTo } = await loadable(() => import('heic-to/next'), 'HEIC decoder');
     if (!(await isHeic(blob as File))) throw nativeError;
     const bitmap = await heicTo({ blob, type: 'bitmap' });
     if (!bitmap) throw nativeError;
@@ -257,7 +282,12 @@ async function process(req: ProcessRequest): Promise<ProcessResponse> {
     return { id: req.id, ok: true, buffer: buf, thumb: thumbBuf, width: W, height: H, mime: req.mime };
   } catch (e) {
     src?.close();
-    return { id: req.id, ok: false, error: e instanceof Error ? e.message : String(e) };
+    return {
+      id: req.id,
+      ok: false,
+      error: e instanceof Error ? e.message : String(e),
+      retryable: e instanceof ChunkLoadError
+    };
   }
 }
 
