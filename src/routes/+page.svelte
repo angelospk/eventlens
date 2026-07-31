@@ -3,7 +3,7 @@
   import { v4 as uuid } from 'uuid';
   import { base } from '$app/paths';
   import { config } from '$lib/config';
-  import { today, formatNight } from '$lib/date';
+  import { today, formatNight, isValidDate } from '$lib/date';
   import { uploads } from '$lib/uploads.svelte';
   import type { Stage } from '$lib/r2-client';
   import { fingerprintOf } from '$lib/fingerprint';
@@ -72,7 +72,21 @@
 
   // Recomputed on every tick rather than frozen at mount: an app left open across midnight
   // would otherwise keep filing photos under yesterday's event.
-  let eventDate = $state(today());
+  let autoDate = $state(today());
+  /**
+   * A night the photographer named by hand, for photographs that belong to an evening that
+   * has already finished.
+   *
+   * Deliberately not remembered across a reload. Filing a whole night under the wrong date
+   * is tedious to undo — every photograph has to be found and moved by hand — and the way
+   * that happens is a choice made last night that nobody remembers making. Reopening the
+   * app always means tonight.
+   */
+  let chosenDate = $state<string | null>(null);
+  let datePanel = $state(false);
+  const eventDate = $derived(chosenDate ?? autoDate);
+  /** The latest night that can be picked: filing photographs into the future is a typo. */
+  const maxDate = $derived(autoDate);
 
   const pendingCount = $derived(items.filter((i) => i.status !== 'error').length);
   const failed = $derived(items.filter((i) => i.status === 'error'));
@@ -245,7 +259,13 @@
     const files = input.files;
     if (!files || !uploads.ready) return;
     pickError = '';
-    eventDate = today(); // the night may have rolled over since the app was opened
+    // The night may have rolled over since the app was opened. An explicit choice is left
+    // alone: it was made for exactly these photographs, seconds ago.
+    autoDate = today();
+    // Read once, here. The loop below awaits on every file, and the night is changeable
+    // while it runs: reading it per file would split one selection across two galleries if
+    // the photographer taps "αλλαγή" while forty photographs are still being copied.
+    const pickedDate = eventDate;
     const pickedAt = Date.now();
     // Captured now: the FileList is cleared in the finally block, and reading its length
     // afterwards reports zero.
@@ -270,7 +290,7 @@
             id: uuid(),
             file: bytes,
             originalName: file.name,
-            eventDate,
+            eventDate: pickedDate,
             status: 'pending',
             attempts: 0,
             fingerprint: fingerprintOf(file),
@@ -399,8 +419,23 @@
     // Returning to a backgrounded app is the other moment worth retrying: mobile browsers
     // freeze timers while the tab is hidden.
     const onVisible = () => {
-      if (document.visibilityState === 'visible') void queue?.resume();
+      if (document.visibilityState !== 'visible') return;
+      // Keep the night on screen honest: a phone left in a pocket across 05:00 would
+      // otherwise still be offering last night as "today".
+      autoDate = today();
+      void queue?.resume();
     };
+    /**
+     * A page restored from the back/forward cache comes back with every variable intact,
+     * including a night chosen hours ago. That is precisely the silent wrong-night upload
+     * this feature has to avoid, so a restore is treated like a fresh open.
+     */
+    const onShow = (e: PageTransitionEvent) => {
+      if (!e.persisted) return;
+      autoDate = today();
+      chosenDate = null;
+    };
+    window.addEventListener('pageshow', onShow);
     // Only runs while something is in flight: no timer burning battery on an idle screen.
     const tick = setInterval(() => {
       if (items.some((i) => i.status === 'uploading')) nowTick = Date.now();
@@ -431,6 +466,7 @@
       window.removeEventListener('offline', goOffline);
       document.removeEventListener('visibilitychange', onVisible);
       window.removeEventListener('beforeinstallprompt', onInstallPrompt);
+      window.removeEventListener('pageshow', onShow);
     };
   });
 
@@ -484,7 +520,10 @@
           <h1>Ανέβασμα</h1>
           <!-- Named rather than numeric: after midnight the photographer needs to see at a
                glance that the shots are still filed under the night that is still going. -->
-          <p class="hint" style="font-size:.78rem">Βραδιά {formatNight(eventDate)}</p>
+          <p class="hint" style="font-size:.78rem">
+            Βραδιά {formatNight(eventDate)}
+            <button class="linkish" onclick={() => (datePanel = !datePanel)}>αλλαγή</button>
+          </p>
         </div>
       </div>
       <span class="chip {connection.cls}">{connection.text}</span>
@@ -492,6 +531,43 @@
       <button class="btn btn-sm" onclick={runDoctor}>Έλεγχος</button>
       <button class="btn btn-sm" onclick={logout}>Έξοδος</button>
     </header>
+
+    {#if datePanel}
+      <!-- A plain visible date field rather than a scripted picker: showPicker() is missing
+           or ignored on exactly the phones this runs on, and a button that opens nothing is
+           worse than no button. -->
+      <div class="notice date-panel">
+        <label for="event-date">Σε ποια βραδιά ανήκουν οι φωτογραφίες</label>
+        <input
+          id="event-date"
+          type="date"
+          max={maxDate}
+          value={eventDate}
+          onchange={(e) => {
+            const v = e.currentTarget.value;
+            if (!isValidDate(v) || v > maxDate) return;
+            chosenDate = v === autoDate ? null : v;
+            datePanel = false;
+          }}
+        />
+        <span class="hint">
+          Ό,τι διαλέξεις από δω και πέρα πάει σε αυτή τη βραδιά. Όσα είναι ήδη στην ουρά
+          κρατάνε τη δική τους.
+        </span>
+      </div>
+    {/if}
+
+    {#if chosenDate}
+      <div class="banner banner-warn">
+        <strong>Ανεβάζεις στη βραδιά {formatNight(chosenDate)}</strong>
+        <!-- Not "they will need approval": whether they do depends on that night's
+             auto-approve setting, which this screen does not know. -->
+        <span>Όχι στη σημερινή. Όσες διαλέξεις τώρα πάνε εκεί.</span>
+        <button class="btn btn-sm" style="margin-top:.5rem" onclick={() => (chosenDate = null)}>
+          Πίσω στη σημερινή
+        </button>
+      </div>
+    {/if}
 
     <div class="stats">
       <div><strong>{completed}</strong><span>ανέβηκαν</span></div>
@@ -712,6 +788,11 @@
             <div class="meta">
               <span class="name">{it.originalName}</span>
               <span class="chip {s.cls}">{s.text}</span>
+              <!-- A row keeps the night it was picked for, so "back to today" must not make
+                   an old-night upload look like tonight's. Shown only when they differ. -->
+              {#if it.eventDate !== autoDate}
+                <span class="chip chip-warn">{formatNight(it.eventDate)}</span>
+              {/if}
               {#if unreadable[it.id]}
                 <span class="error">
                   Το αρχείο δεν είναι πια διαθέσιμο στη συσκευή. Διάλεξέ το ξανά.
@@ -1019,6 +1100,33 @@
   .notice strong {
     color: var(--warn);
     font-size: 0.9rem;
+  }
+
+  /* A link inside a line of small print, not another button competing with the toolbar. */
+  .linkish {
+    background: none;
+    border: 0;
+    padding: 0 0 0 0.35rem;
+    font: inherit;
+    color: var(--accent);
+    text-decoration: underline;
+    cursor: pointer;
+  }
+
+  .date-panel label {
+    font-size: 0.85rem;
+    font-weight: 600;
+  }
+
+  .date-panel input {
+    font: inherit;
+    /* 16px or larger, or iOS zooms the whole page in when the field is focused. */
+    font-size: 1rem;
+    padding: 0.5rem 0.6rem;
+    color: var(--text);
+    background: var(--surface-2);
+    border: 1px solid var(--line);
+    border-radius: var(--r-input, 8px);
   }
 
   .skipped {
