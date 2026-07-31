@@ -37,8 +37,14 @@
   // already abort themselves well before this; a photograph still here after it is one the
   // photographer should be able to take into their own hands.
   const STUCK_AFTER_MS = 25_000;
+  // Which photograph this instance is genuinely working on. A row can say 'uploading' in
+  // the database while nobody is uploading it — another tab held the queue, or the app was
+  // killed mid-attempt — and calling that "uploading" is how six photographs end up looking
+  // busy at once when only one ever is.
+  let activeId = $state<string | null>(null);
+  const isUploading = (it: QueueItem) => it.status === 'uploading' && it.id === activeId;
   const isStuck = (it: QueueItem) =>
-    it.status === 'uploading' && !!it.startedAt && nowTick - it.startedAt > STUCK_AFTER_MS;
+    isUploading(it) && !!it.startedAt && nowTick - it.startedAt > STUCK_AFTER_MS;
   const stuckItems = $derived(items.filter(isStuck));
   let doctorOpen = $state(false);
   let doctorRunning = $state(false);
@@ -91,6 +97,7 @@
     syncThumbs(list);
     items = list;
     completed = queue?.completed ?? 0;
+    activeId = queue?.activeId ?? null;
     struggling = queue?.struggling ?? false;
     const done = queue?.lastDone;
     if (done && done.at !== lastDone?.at) {
@@ -269,7 +276,7 @@
   function statusLabel(it: QueueItem) {
     if (it.status === 'error') return { text: 'Δεν στάλθηκε', cls: 'chip-danger' };
     if (isStuck(it)) return { text: 'Αργεί πολύ', cls: 'chip-warn' };
-    if (it.status === 'uploading') {
+    if (isUploading(it)) {
       // Naming the step matters on a slow link: a photo can sit on "sending" for a minute
       // and the photographer needs to see movement, not wonder whether it is stuck.
       const st = stage?.id === it.id ? STAGE_TEXT[stage.stage] : 'Ανεβαίνει';

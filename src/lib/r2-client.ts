@@ -105,7 +105,7 @@ export function makeR2Uploader(deps: R2UploaderDeps): Uploader {
         throw new AlreadyUploadedError(item.id);
       }
       if (!signRes.ok) throw classifyStatus(signRes.status, 'sign') ?? new Error(`sign failed ${signRes.status}`);
-      const { uploadUrl, thumbUploadUrl } = (await signRes.json()) as SignResult;
+      const { uploadUrl, thumbUploadUrl, key } = (await signRes.json()) as SignResult;
 
       // 2) Encode with the browser's own encoder. Fast enough that the photographer sees
       //    it as instant, unlike the WebAssembly encoder this replaced.
@@ -143,12 +143,14 @@ export function makeR2Uploader(deps: R2UploaderDeps): Uploader {
         }
       }
 
-      // 4) Confirm metadata. Server already knows key/public_url from /sign;
-      //    we only confirm + report dimensions. Idempotent on id.
+      // 4) Confirm metadata. The key goes back with it so the server confirms the object
+      //    these bytes actually went to: a retry under a different format re-signs the row,
+      //    and confirming whatever the row last said would publish a URL pointing at
+      //    nothing. Idempotent on id.
       const meta: PhotoMeta = {
         id: item.id, original_name: item.originalName,
         width: out.width, height: out.height, bytes: out.bytes,
-        hasThumb
+        hasThumb, key
       };
       stage(item.id, 'confirming');
       const metaRes = await f(`${deps.workerUrl}/meta`, {

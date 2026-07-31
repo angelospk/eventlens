@@ -67,6 +67,18 @@ export class UploadQueue {
   get lastDone() { return this._lastDone; }
 
   /**
+   * The photograph this instance is actually working on, if any. A row can read as
+   * 'uploading' in the database without this instance being the one doing it — another tab
+   * may hold the queue, or the app may have been killed mid-attempt. The interface has to
+   * go by this instead, or it shows several photographs uploading at once when only ever
+   * one is, which reads as everything being stuck.
+   */
+  get activeId(): string | null {
+    for (const id of this.inFlight.keys()) return id;
+    return null;
+  }
+
+  /**
    * True once the network has failed us repeatedly. One failure is noise; two in a row
    * means the photographer should be told the connection is the problem, not their photos.
    */
@@ -152,32 +164,83 @@ export class UploadQueue {
   }
 
   /**
-   * Cross-tab single-flight, but never at the cost of not uploading at all.
+   * Cross-tab single-flight that can still tell a busy holder from a dead one.
    *
-   * A plain `locks.request` waits for the lock forever. iOS does not reliably tear a page
-   * down when the app is closed: a frozen previous instance can still hold it, and the new
-   * one then waits for a release that is never coming. The photographs sit there, the
-   * statuses stay as they were, and nothing explains it.
+   * Two problems pull in opposite directions. A plain `locks.request` waits forever, and
+   * iOS does not reliably tear a page down when the app is closed, so a frozen previous
+   * instance can hold the lock and the new one waits for a release that never comes.
+   * Bypassing the lock on a timer instead is worse: two live instances then drain the same
+   * database at once, each resetting rows the other is working on, and nothing finishes
+   * while the queue looks like six photographs uploading simultaneously.
    *
-   * So the lock is asked for, not waited on. If something else genuinely holds it we back
-   * off briefly and ask again; if it is still held we go ahead anyway. Two drains at once
-   * is wasteful but safe, because the server answers a photograph it already has with a
-   * 409 that counts as success. A queue that never runs is not safe at all.
+   * So the holder proves it is alive. It stamps a shared heartbeat while it works, and a
+   * waiter only takes over once that heartbeat has stopped. A busy holder is waited for,
+   * however long it takes; a frozen one is stepped over within a few seconds.
    */
   private async withLock<T>(fn: () => Promise<T>): Promise<T> {
     const locks = (globalThis as any).navigator?.locks;
-    if (!locks?.request) return fn();
+    if (!locks?.request) return this.beating(fn);
+    // Without shared storage there is no way to tell the two cases apart, so fall back to
+    // waiting: a stalled queue is recoverable by reopening the app, duplicate drains are
+    // not something the photographer can see or fix.
+    if (!UploadQueue.canBeat()) {
+      return locks.request('eventlens-upload', () => this.beating(fn));
+    }
 
-    for (let attempt = 0; attempt < 2; attempt++) {
+    for (;;) {
       const result = await locks.request(
         'eventlens-upload',
         { ifAvailable: true },
-        async (lock: unknown) => (lock ? { held: true, value: await fn() } : { held: false })
+        async (lock: unknown) => (lock ? { held: true, value: await this.beating(fn) } : { held: false })
       );
       if (result.held) return result.value as T;
-      await sleep(1500);
+      if (this.stopped) return undefined as T;
+      if (Date.now() - UploadQueue.lastBeat() > UploadQueue.BEAT_STALE_MS) {
+        return this.beating(fn); // the holder stopped breathing
+      }
+      await sleep(2000); // someone else is genuinely uploading; let them finish
     }
-    return fn();
+  }
+
+  private static readonly BEAT_KEY = 'eventlens-drain-beat';
+  private static readonly BEAT_MS = 3000;
+  /** Four missed beats. Long enough that a busy holder is never mistaken for a dead one. */
+  private static readonly BEAT_STALE_MS = 12_000;
+
+  private static canBeat(): boolean {
+    try {
+      return typeof localStorage !== 'undefined' && localStorage !== null;
+    } catch {
+      return false; // storage blocked (private mode, embedded webview)
+    }
+  }
+
+  private static lastBeat(): number {
+    try {
+      return Number(localStorage.getItem(UploadQueue.BEAT_KEY)) || 0;
+    } catch {
+      return 0;
+    }
+  }
+
+  private static beat() {
+    try {
+      localStorage.setItem(UploadQueue.BEAT_KEY, String(Date.now()));
+    } catch {
+      // Storage full or blocked. The worst case is a waiter deciding we are dead and
+      // joining in, which is what the old code did unconditionally.
+    }
+  }
+
+  /** Runs the drain while telling every other instance that this one is still alive. */
+  private async beating<T>(fn: () => Promise<T>): Promise<T> {
+    UploadQueue.beat();
+    const timer = setInterval(() => UploadQueue.beat(), UploadQueue.BEAT_MS);
+    try {
+      return await fn();
+    } finally {
+      clearInterval(timer);
+    }
   }
 
   /**

@@ -70,6 +70,8 @@ export interface PhotoMeta {
   bytes: number;
   /** Whether the gallery-sized copy made it up too. */
   hasThumb?: boolean;
+  /** The key /sign issued for this attempt, so the server confirms what was written. */
+  key?: string;
 }
 
 // Returned by /sign.

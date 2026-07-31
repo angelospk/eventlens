@@ -532,9 +532,44 @@ test('rows left mid-flight by a kill are put back in line, not shown as uploadin
   expect(await store.all()).toEqual([]);
 });
 
+/** A lock manager that never grants, the way a holder looks from another instance. */
+function heldLocks() {
+  return {
+    locks: {
+      request: async (_n: string, opts: any, cb: any) =>
+        // `ifAvailable` hands back null rather than queueing behind the holder.
+        opts?.ifAvailable ? cb(null) : new Promise(() => {})
+    }
+  };
+}
+
+/** Shared heartbeat storage, the part two instances of the app can both see. */
+function fakeStorage(initial?: Record<string, string>) {
+  const map = new Map(Object.entries(initial ?? {}));
+  return {
+    getItem: (k: string) => map.get(k) ?? null,
+    setItem: (k: string, v: string) => void map.set(k, v)
+  };
+}
+
+async function withGlobals(
+  patch: { navigator?: any; localStorage?: any },
+  fn: () => Promise<void>
+) {
+  const g = globalThis as any;
+  const saved = { navigator: g.navigator, localStorage: g.localStorage };
+  Object.assign(g, patch);
+  try {
+    await fn();
+  } finally {
+    Object.assign(g, saved);
+  }
+}
+
 test('a lock held by a frozen previous instance does not stop the queue forever', async () => {
   // iOS does not reliably tear a page down when the app is closed. If the old instance
-  // still holds the Web Lock, waiting for it means never uploading again.
+  // still holds the Web Lock and has stopped running, waiting for it means never
+  // uploading again — so a heartbeat that stopped long ago is treated as a dead holder.
   const store = new MemStore();
   const uploaded: string[] = [];
   const q = new UploadQueue(
@@ -544,22 +579,44 @@ test('a lock held by a frozen previous instance does not stop the queue forever'
   );
   await q.enqueue(item('waiting'));
 
-  // A lock manager that never grants anything, the way a wedged holder looks from here.
-  const original = (globalThis as any).navigator;
-  (globalThis as any).navigator = {
-    locks: {
-      request: async (_n: string, opts: any, cb: any) =>
-        // `ifAvailable` hands back null rather than queueing behind the holder.
-        opts?.ifAvailable ? cb(null) : new Promise(() => {})
+  await withGlobals(
+    {
+      navigator: heldLocks(),
+      localStorage: fakeStorage({ 'eventlens-drain-beat': String(Date.now() - 60_000) })
+    },
+    async () => {
+      await q.drain();
+      expect(uploaded).toEqual(['waiting']); // went ahead rather than waiting for ever
+      expect(await store.all()).toEqual([]);
     }
-  };
+  );
+}, 20000);
 
+test('a lock held by an instance that is still working is waited for, not stolen', async () => {
+  // The other half of the same problem, and the one that made six photographs look like
+  // they were uploading at once: two live instances draining the same database.
+  const store = new MemStore();
+  const uploaded: string[] = [];
+  const q = new UploadQueue(
+    store,
+    { async run(it: QueueItem) { uploaded.push(it.id); } },
+    { baseMs: 1, maxMs: 4, maxAttempts: 3 }
+  );
+  await q.enqueue(item('theirs'));
+
+  // The holder stamps the moment it takes the lock, so a live one is never seen unstamped.
+  const beats = fakeStorage({ 'eventlens-drain-beat': String(Date.now()) });
+  const alive = setInterval(() => beats.setItem('eventlens-drain-beat', String(Date.now())), 200);
   try {
-    await q.drain();
-    expect(uploaded).toEqual(['waiting']); // went ahead rather than waiting for ever
-    expect(await store.all()).toEqual([]);
+    await withGlobals({ navigator: heldLocks(), localStorage: beats }, async () => {
+      const draining = q.drain();
+      await new Promise((r) => setTimeout(r, 3000)); // well past the old 3s bypass
+      expect(uploaded).toEqual([]); // left alone; the holder is doing the work
+      q.stop();
+      await draining;
+    });
   } finally {
-    (globalThis as any).navigator = original;
+    clearInterval(alive);
   }
 }, 20000);
 
@@ -607,7 +664,7 @@ test('a retry asked for while the queue is winding down still runs', async () =>
   let fail = true;
   const q = new UploadQueue(
     store,
-    { async run() { if (fail) throw new NonRetryableError('bad file', 400); } },
+    { async run() { if (fail) throw new NonRetryableError('bad file', 'bad_request'); } },
     { baseMs: 1, maxMs: 2, maxAttempts: 3 }
   );
   await q.enqueue(item('w'));

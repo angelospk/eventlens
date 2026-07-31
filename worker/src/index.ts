@@ -271,6 +271,8 @@ export default {
         height: number;
         bytes: number;
         hasThumb?: boolean;
+        /** The key /sign handed out for this attempt. Older clients do not send it. */
+        key?: string;
       }>(req);
       if (!m) return badInput(env);
       if (!ID_RE.test(m.id)) return badInput(env);
@@ -290,13 +292,26 @@ export default {
         .first<{ auto_approve: number }>();
       const moderation = ev?.auto_approve ? 'approved' : 'pending';
 
+      // Confirmed against the key this attempt actually wrote, not whatever the row happens
+      // to say. Two attempts can overlap — a retry under a different format re-signs the row
+      // — and confirming the row's key would publish a photograph whose URL points at an
+      // object the winning attempt never uploaded.
+      const confirmedKey = m.key && m.key.startsWith(`${EVENT_PREFIX}${row.event_date}/`)
+        ? m.key
+        : null;
+
       const res = await env.DB.prepare(
         `UPDATE photos
          SET width=?, height=?, bytes=?, original_name=COALESCE(?, original_name),
+             r2_key=COALESCE(?, r2_key), public_url=COALESCE(?, public_url),
              status='confirmed', moderation=?, has_thumb=?
          WHERE id=? AND status='pending'`
       )
-        .bind(m.width, m.height, m.bytes, m.original_name ?? null, moderation, m.hasThumb ? 1 : 0, m.id)
+        .bind(
+          m.width, m.height, m.bytes, m.original_name ?? null,
+          confirmedKey, confirmedKey ? `${env.PUBLIC_BASE}/${confirmedKey}` : null,
+          moderation, m.hasThumb ? 1 : 0, m.id
+        )
         .run();
       if ((res.meta.changes ?? 0) === 0) return json({ error: 'unknown_or_confirmed' }, env, 404);
       // Only when the photo actually went public: during a reviewed night nothing changed
