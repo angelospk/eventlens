@@ -439,6 +439,10 @@
     // Only runs while something is in flight: no timer burning battery on an idle screen.
     const tick = setInterval(() => {
       if (items.some((i) => i.status === 'uploading')) nowTick = Date.now();
+      // A phone propped up on a table never fires visibilitychange, so the night would
+      // otherwise still read as yesterday at ten past five with the screen in plain sight.
+      const night = today();
+      if (night !== autoDate) autoDate = night;
     }, 2000);
 
     window.addEventListener('online', goOnline);
@@ -545,7 +549,12 @@
           value={eventDate}
           onchange={(e) => {
             const v = e.currentTarget.value;
-            if (!isValidDate(v) || v > maxDate) return;
+            // Clearing the field, or typing a date in the future, leaves the night alone —
+            // and the field is put back to it, so what is shown is what will be used.
+            if (!isValidDate(v) || v > maxDate) {
+              e.currentTarget.value = eventDate;
+              return;
+            }
             chosenDate = v === autoDate ? null : v;
             datePanel = false;
           }}
