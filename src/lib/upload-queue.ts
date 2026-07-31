@@ -128,6 +128,12 @@ export class UploadQueue {
   get storageFailing() { return this.dead.size > 0; }
 
   /**
+   * The photographs the queue has given up on. Shown so they can be removed in one move:
+   * they will never go up on their own, and left in place they read as "still trying".
+   */
+  get abandoned(): string[] { return [...this.dead]; }
+
+  /**
    * Adds a photograph unless it is already here or already sent.
    *
    * Re-picking files is the normal way this goes wrong at an event: the photographer opens

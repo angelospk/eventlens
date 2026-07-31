@@ -336,6 +336,31 @@
     for (const id of stuckItems.map((i) => i.id)) await queue.cancel(id);
   }
 
+  /**
+   * The way out of a wedged row, whatever wedged it.
+   *
+   * Every state used to have its own buttons and "queued, going nowhere" had none — which
+   * is exactly the state a photograph the device can no longer read ends up in. There has
+   * to be one move that always works, or the only remedy left is deleting the whole app.
+   */
+  async function cancelOne(it: QueueItem) {
+    const sure = confirm(
+      `«${it.originalName}»: θα διαγραφεί από την ουρά και δεν θα σταλεί. Σίγουρα;`
+    );
+    if (sure) await queue.cancel(it.id);
+  }
+
+  async function cancelAbandoned() {
+    const ids = uploads.abandoned;
+    const sure = confirm(
+      ids.length === 1
+        ? 'Η φωτογραφία θα αφαιρεθεί από την ουρά. Διάλεξέ την ξανά για να σταλεί.'
+        : `${ids.length} φωτογραφίες θα αφαιρεθούν από την ουρά. Διάλεξέ τες ξανά για να σταλούν.`
+    );
+    if (!sure) return;
+    for (const id of ids) await queue.cancel(id);
+  }
+
   function statusLabel(it: QueueItem) {
     if (it.status === 'error') return { text: 'Δεν στάλθηκε', cls: 'chip-danger' };
     if (isStuck(it)) return { text: 'Αργεί πολύ', cls: 'chip-warn' };
@@ -489,6 +514,11 @@
           Κάποιες φωτογραφίες σταμάτησαν γι᾽ αυτό, όχι λόγω δικτύου. Κλείσε και ξανάνοιξε
           την εφαρμογή· αν επιμείνει, ελευθέρωσε χώρο στο κινητό.
         </span>
+        {#if uploads.abandoned.length > 0}
+          <button class="btn btn-sm btn-danger" style="margin-top:.5rem" onclick={cancelAbandoned}>
+            Αφαίρεσε {uploads.abandoned.length} από την ουρά
+          </button>
+        {/if}
       </div>
     {:else if uploads.blocked}
       <div class="banner banner-warn">
@@ -705,13 +735,12 @@
                 <button class="btn btn-sm" onclick={() => queue.retryItem(it.id)}>Ξανά</button>
                 <button class="btn btn-sm btn-danger" onclick={() => queue.discard(it.id)}>Διαγραφή</button>
               </div>
-            {:else if isStuck(it)}
+            {:else}
               <div class="row-actions">
-                <button class="btn btn-sm" onclick={() => queue.retryItem(it.id)}>Ξανά</button>
-                <button class="btn btn-sm btn-danger"
-                        onclick={() => confirm('Η φωτογραφία θα διαγραφεί και δεν θα σταλεί. Σίγουρα;') && queue.cancel(it.id)}>
-                  Άκυρο
-                </button>
+                {#if isStuck(it)}
+                  <button class="btn btn-sm" onclick={() => queue.retryItem(it.id)}>Ξανά</button>
+                {/if}
+                <button class="btn btn-sm btn-danger" onclick={() => cancelOne(it)}>Άκυρο</button>
               </div>
             {/if}
           </li>
