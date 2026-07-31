@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount, onDestroy } from 'svelte';
+  import { onMount, onDestroy, untrack } from 'svelte';
   import { v4 as uuid } from 'uuid';
   import { base } from '$app/paths';
   import { config } from '$lib/config';
@@ -86,17 +86,23 @@
   // Previews are this screen's business, not the queue's, so they are kept here and
   // rebuilt whenever the shared list changes.
   $effect(() => {
-    syncThumbs(uploads.items);
+    const list = uploads.items;
     const done = uploads.lastDone;
-    if (done && done.at !== lastDone?.at) {
-      // Exactly one preview is held at a time; the previous one is released here rather
-      // than accumulating a night's worth of object URLs.
-      if (lastDone) URL.revokeObjectURL(lastDone.url);
-      lastDone = { name: done.name, at: done.at, url: URL.createObjectURL(done.file) };
-    }
-    // The first request that gets through exchanges the passcode for a token, which
-    // retroactively confirms an offline sign-in.
-    if (unverified && session.verified) unverified = false;
+    // The bodies below both read and write the previews they maintain, which inside a
+    // tracked block would make the effect re-run itself forever. Only the queue's own
+    // state above decides when this runs.
+    untrack(() => {
+      syncThumbs(list);
+      if (done && done.at !== lastDone?.at) {
+        // Exactly one preview is held at a time; the previous one is released here rather
+        // than accumulating a night's worth of object URLs.
+        if (lastDone) URL.revokeObjectURL(lastDone.url);
+        lastDone = { name: done.name, at: done.at, url: URL.createObjectURL(done.file) };
+      }
+      // The first request that gets through exchanges the passcode for a token, which
+      // retroactively confirms an offline sign-in.
+      if (unverified && session.verified) unverified = false;
+    });
   });
 
   const refresh = () => uploads.refresh();

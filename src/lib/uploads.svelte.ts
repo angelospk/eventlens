@@ -31,8 +31,10 @@ class Uploads {
   /** True once there is a queue to talk to. */
   ready = $state(false);
 
-  queue: UploadQueue | null = null;
-  store: QueueStore | null = null;
+  // Reactive, not plain fields: the screens derive from these, and a plain field assigned
+  // after the derivation was set up leaves them holding the null it started with.
+  queue = $state<UploadQueue | null>(null);
+  store = $state<QueueStore | null>(null);
   // A manager's token is accepted here too: same person, and being asked for a second
   // passcode just to upload is friction with nothing behind it.
   readonly session = new Session(config.workerUrl, 'photographer', undefined, ['manager']);
