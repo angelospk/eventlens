@@ -2,8 +2,8 @@
   import { onMount, onDestroy } from 'svelte';
   import { browser } from '$app/environment';
   import { config } from '$lib/config';
-  import { today, formatGreek, isValidDate } from '$lib/date';
-  import { fetchWall } from '$lib/wall-client';
+  import { today, formatGreek, formatNight, isValidDate } from '$lib/date';
+  import { fetchWall, fetchDays, type EventDay } from '$lib/wall-client';
   import type { WallPhoto } from '$lib/types';
 
   // The public page for guests, and the one that gets embedded in ardasfestival.gr. It is
@@ -19,9 +19,27 @@
   let photos = $state<WallPhoto[]>([]);
   let loaded = $state(false);
   let lightboxIndex = $state<number | null>(null);
+  /**
+   * Every night the festival has photographs for.
+   *
+   * This is what makes one embedded iframe enough for the whole festival: a new evening
+   * appears as another tab here rather than as another block someone has to add to the
+   * host page. Kept even when there is only one night, so nobody wonders where the rest
+   * went on the second day.
+   */
+  let days = $state<EventDay[]>([]);
+  /** True when the visitor asked for a night by hand, which then outranks anything new. */
+  let pinned = false;
 
   let timer: ReturnType<typeof setInterval> | null = null;
   let inflight: AbortController | null = null;
+  let daysInflight: AbortController | null = null;
+  /**
+   * Which night the newest request was for. A viewer tapping through four tabs leaves four
+   * requests in the air, and without this the slowest one wins and puts the wrong evening's
+   * photographs under the wrong heading.
+   */
+  let wanted = '';
 
   // Newest first: on a live page the last photo taken is the one people want to see.
   const ordered = $derived([...photos].reverse());
@@ -31,17 +49,64 @@
     inflight?.abort();
     inflight = new AbortController();
     const signal = inflight.signal;
+    const asked = date;
+    wanted = asked;
     try {
       const res = await fetchWall(
         { workerUrl: config.workerUrl, fetchImpl: (u, o) => fetch(u, { ...o, signal }) },
-        date
+        asked
       );
+      if (wanted !== asked) return; // the viewer moved on while this was in the air
       photos = res.photos;
     } catch {
       // Keep whatever is already on screen and try again on the next tick.
     } finally {
-      loaded = true;
+      if (wanted === asked) loaded = true;
     }
+  }
+
+  /**
+   * Refreshes the list of nights, and picks one the first time round.
+   *
+   * A visitor who has not asked for a night gets the newest one that actually has
+   * photographs — decided by the Worker, not by this browser's clock, because a viewer in
+   * another country would otherwise resolve a different evening. Someone already looking at
+   * a night is never moved off it when a newer one appears; the tab simply shows up.
+   */
+  async function refreshDays(first = false) {
+    daysInflight?.abort();
+    daysInflight = new AbortController();
+    const signal = daysInflight.signal;
+    try {
+      const res = await fetchDays({
+        workerUrl: config.workerUrl,
+        fetchImpl: (u, o) => fetch(u, { ...o, signal })
+      });
+      days = res.days;
+      if (first && !pinned && res.defaultDate) {
+        date = res.defaultDate;
+        return true;
+      }
+    } catch {
+      // No strip, one night. Strictly better than an empty page.
+    }
+    return false;
+  }
+
+  function pick(d: string) {
+    if (d === date) return;
+    pinned = true;
+    date = d;
+    lightboxIndex = null;
+    photos = [];
+    loaded = false;
+    // Keeps the address bar honest so the night on screen can be linked to or reloaded.
+    // replaceState rather than pushState: tabbing through nights should not fill the back
+    // button with steps out of an iframe.
+    const url = new URL(location.href);
+    url.searchParams.set('date', d);
+    history.replaceState(null, '', url);
+    refresh();
   }
 
   // Returns focus to the thumbnail when the lightbox closes, so keyboard users are not
@@ -97,38 +162,73 @@
   // itself, so without this the gallery would be cut off at whatever fixed height the host
   // guessed, and it grows every time a photo is approved.
   let observer: ResizeObserver | null = null;
+  /** Measured instead of the document: see below. */
+  let contentEl: HTMLElement | null = $state(null);
+  let sentHeight = 0;
+  let raf = 0;
 
   function reportHeight() {
-    if (window.parent === window) return;
-    const h = Math.ceil(document.documentElement.scrollHeight);
-    window.parent.postMessage({ type: 'eventlens:height', height: h }, '*');
+    if (window.parent === window || !contentEl) return;
+    // The content's own height, not the document's. Once the browser has stretched
+    // <html> to fill a tall iframe it does not shrink back, so measuring the document
+    // means the gallery can grow when a night is added and never shrink when the viewer
+    // switches to a shorter one — leaving a screen of blank space on the host page.
+    const h = Math.ceil(contentEl.getBoundingClientRect().height);
+    if (h === sentHeight || h <= 0) return;
+    sentHeight = h;
+    // Named, not '*': the height is harmless, but a wildcard hands any page that frames
+    // this a message channel it did not have to ask for.
+    for (const origin of config.embedOrigins) {
+      window.parent.postMessage({ type: 'eventlens:height', height: h }, origin);
+    }
+  }
+
+  /** Coalesces the burst of observer callbacks a layout change produces into one message. */
+  function scheduleHeight() {
+    if (raf) return;
+    raf = requestAnimationFrame(() => {
+      raf = 0;
+      reportHeight();
+    });
   }
 
   onMount(() => {
     if (!browser) return;
     const qd = new URLSearchParams(location.search).get('date');
-    if (qd && isValidDate(qd)) date = qd;
-    refresh();
-    timer = setInterval(refresh, POLL_MS);
+    // An explicit date always wins, even for a night with nothing in it: a link someone was
+    // sent must show what it says, not quietly redirect to a different evening.
+    if (qd && isValidDate(qd)) {
+      date = qd;
+      pinned = true;
+    }
+    // The night is settled before the photographs are asked for, so an unpinned visitor
+    // does not watch an empty "today" load and then get replaced.
+    void refreshDays(true).then(refresh);
+    timer = setInterval(() => {
+      refresh();
+      refreshDays();
+    }, POLL_MS);
     // Come back from a backgrounded tab with fresh photos rather than a stale grid.
     const onVisible = () => document.visibilityState === 'visible' && refresh();
     document.addEventListener('visibilitychange', onVisible);
 
-    observer = new ResizeObserver(reportHeight);
-    observer.observe(document.documentElement);
+    observer = new ResizeObserver(scheduleHeight);
+    if (contentEl) observer.observe(contentEl);
     // Images settle after the observer fires, so report again once they have loaded.
-    window.addEventListener('load', reportHeight);
+    window.addEventListener('load', scheduleHeight);
 
     return () => {
       document.removeEventListener('visibilitychange', onVisible);
-      window.removeEventListener('load', reportHeight);
+      window.removeEventListener('load', scheduleHeight);
     };
   });
 
   onDestroy(() => {
     if (timer !== null) clearInterval(timer);
+    if (raf) cancelAnimationFrame(raf);
     observer?.disconnect();
     inflight?.abort();
+    daysInflight?.abort();
   });
 </script>
 
@@ -142,8 +242,22 @@
 
 <svelte:window onkeydown={onKey} />
 
-<div class="page">
+<div class="page" bind:this={contentEl}>
   <h1>{heading}</h1>
+
+  <!-- One tab per evening, newest first. Hidden while there is only one night: a single tab
+       is a control that cannot do anything. -->
+  {#if days.length > 1}
+    <nav class="days" aria-label="Βραδιές">
+      {#each days as d (d.date)}
+        <button class="day" class:on={d.date === date} onclick={() => pick(d.date)}
+                aria-current={d.date === date ? 'true' : undefined}>
+          {d.title || formatNight(d.date)}
+          <span class="count">{d.count}</span>
+        </button>
+      {/each}
+    </nav>
+  {/if}
 
   {#if !loaded}
     <div class="grid" aria-hidden="true">
@@ -202,6 +316,46 @@
     font-size: clamp(1.6rem, 5vw, 2.5rem);
     line-height: 1.15;
     letter-spacing: -0.01em;
+  }
+
+  /* Scrolls sideways rather than wrapping: a festival that runs a week would otherwise
+     push the photographs down the page behind four rows of tabs. */
+  .days {
+    display: flex;
+    gap: 0.5rem;
+    margin: 0 0 clamp(1rem, 3vw, 1.75rem);
+    padding-bottom: 0.35rem;
+    overflow-x: auto;
+    scrollbar-width: thin;
+  }
+
+  .day {
+    flex: none;
+    display: inline-flex;
+    align-items: baseline;
+    gap: 0.4rem;
+    padding: 0.45rem 0.9rem;
+    font: inherit;
+    font-size: 0.9rem;
+    color: #6b6b6b;
+    background: #f4f4f4;
+    border: 1px solid transparent;
+    border-radius: 999px;
+    cursor: pointer;
+    white-space: nowrap;
+  }
+
+  .day:hover { color: #000; }
+
+  .day.on {
+    color: #fff;
+    background: #000;
+  }
+
+  .day .count {
+    font-size: 0.75rem;
+    opacity: 0.6;
+    font-variant-numeric: tabular-nums;
   }
 
   /* Columns rather than a square grid: event photos mix portrait and landscape, and

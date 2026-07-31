@@ -3,6 +3,15 @@ export const config = {
   workerUrl: import.meta.env?.VITE_WORKER_URL ?? 'http://localhost:8787',
   // logo path is resolved against the SvelteKit base path at call sites (see processor):
   logoFile: 'logo.png',
+  /**
+   * Pages allowed to be told how tall the embedded gallery is.
+   *
+   * The gallery cannot see who is framing it, so it posts its height to each of these by
+   * name. A wildcard would work too, and would hand every page that frames the gallery a
+   * message channel it never had to ask for. Both spellings of the host are listed because
+   * postMessage matches the origin exactly and www is a different origin.
+   */
+  embedOrigins: ['https://ardasfestival.gr', 'https://www.ardasfestival.gr'],
   // Encoder quality, 0-100. Everything ends up as WebP: natively where the browser can,
   // and through a WebAssembly encoder on Safari, which cannot encode WebP from a canvas
   // and whose JPEG ran about five times larger per megapixel. The old AVIF encoder was

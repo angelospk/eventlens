@@ -147,7 +147,22 @@ export default {
      * leaves it on the projector for up to the stale-while-revalidate window: the manager
      * clicks "hide" and watches the photo stay up for another minute.
      */
-    const purgeWall = (date: string) => ctx.waitUntil(caches.default.delete(wallKey(date)));
+    /** The list of nights that have something to show. One payload, no parameters. */
+    const daysKey = () => new Request(`${url.origin}/days`, { method: 'GET' });
+
+    /**
+     * Anything that changes what a night shows can also change whether the night appears in
+     * the index at all — approving the first photograph of an evening puts it on the list,
+     * deleting the last one takes it off. Tying the two together means every existing call
+     * site invalidates both, rather than a new one being forgotten in six months.
+     *
+     * Both are best-effort: `caches.default.delete` only clears the data centre that
+     * handled the request. Elsewhere the short s-maxage does the work.
+     */
+    const purgeWall = (date: string) => {
+      ctx.waitUntil(caches.default.delete(wallKey(date)));
+      ctx.waitUntil(caches.default.delete(daysKey()));
+    };
 
     /**
      * Drops the cached image bytes for one object. Images are cached for a year as
@@ -398,6 +413,38 @@ export default {
       return res;
     }
 
+    // --- GET /days — public. Which nights have anything to show, newest first. This is what
+    // lets one embedded gallery grow a new tab per evening without anyone touching the host
+    // page. Counted rather than listed: the strip needs a number, not the photographs.
+    if (url.pathname === '/days' && req.method === 'GET') {
+      const cache = caches.default;
+      const cacheKey = daysKey();
+      const hit = await cache.match(cacheKey);
+      if (hit) return hit;
+
+      // Aggregated before the join: grouping first keeps the events lookup to one row per
+      // night instead of one per photograph.
+      const { results } = await env.DB.prepare(
+        `WITH visible AS (
+           SELECT event_date, COUNT(*) AS n
+           FROM photos
+           WHERE status = 'confirmed' AND moderation = 'approved'
+           GROUP BY event_date
+         )
+         SELECT visible.event_date, visible.n, events.title
+         FROM visible LEFT JOIN events ON events.event_date = visible.event_date
+         ORDER BY visible.event_date DESC`
+      ).all<{ event_date: string; n: number; title: string | null }>();
+
+      const days = (results ?? []).map((d) => ({ date: d.event_date, count: d.n, title: d.title }));
+      // Chosen here rather than on the client: a viewer in another country has a different
+      // idea of what "today" is, and the newest night with photographs in it is the same
+      // answer for everyone.
+      const res = json({ days, defaultDate: days[0]?.date ?? null }, env, 200, PUBLIC_CACHE);
+      ctx.waitUntil(cache.put(cacheKey, res.clone()));
+      return res;
+    }
+
     // --- GET /list — manager only. Everything for the night, including photos still
     // awaiting review, so the manager can actually moderate.
     if (url.pathname === '/list' && req.method === 'GET') {
@@ -492,6 +539,10 @@ export default {
         return json({ error: 'storage_delete_failed' }, env, 502);
       }
       await env.DB.prepare(`DELETE FROM photos WHERE id=?`).bind(body.id).run();
+      // Again, after the row is actually gone: the first purge ran while it was only
+      // tombstoned, so a reader in between could have refilled the cache with a count
+      // that still included it.
+      purgeWall(row.event_date);
       // The bytes are gone; the edge must not keep serving either size.
       purgeImage(row.r2_key);
       purgeImage(thumbKey);
