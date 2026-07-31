@@ -562,3 +562,61 @@ test('a lock held by a frozen previous instance does not stop the queue forever'
     (globalThis as any).navigator = original;
   }
 }, 20000);
+
+test('retrying a wedged upload keeps the photograph instead of deleting it', async () => {
+  // The field report: several photos sat on "uploading", the photographer pressed
+  // "try them all again", and they vanished. The button cancelled first — which removes
+  // the row — and then reset a row that was already gone.
+  const store = new MemStore();
+  let calls = 0;
+  const uploader = {
+    async run(_it: QueueItem, signal?: AbortSignal) {
+      calls++;
+      if (calls > 1) return; // the retry goes through
+      await new Promise((_resolve, reject) => {
+        signal?.addEventListener('abort', () => reject(new Error('cancelled')), { once: true });
+      });
+    }
+  };
+  // A long backoff on purpose. With a short one the abandoned attempt's own failure would
+  // restart the item within a millisecond and the test would pass whether or not the reset
+  // did anything. Here nothing but the reset can make it run again.
+  const q = new UploadQueue(store, uploader, { baseMs: 60_000, maxMs: 60_000, maxAttempts: 3 });
+  await q.enqueue(item('a'));
+  const draining = q.drain();
+
+  // Wait for it to be genuinely in the air, i.e. wedged.
+  for (let i = 0; i < 100 && store.items.get('a')?.status !== 'uploading'; i++) {
+    await new Promise((r) => setTimeout(r, 5));
+  }
+  expect(store.items.get('a')?.status).toBe('uploading');
+
+  await q.retryMany(['a']);
+  await draining;
+
+  expect(calls).toBe(2);
+  expect(q.completed).toBe(1);   // it went up
+  expect(store.items.size).toBe(0); // removed because it finished, not because it was dropped
+});
+
+test('a retry asked for while the queue is winding down still runs', async () => {
+  // The subtle half of the vanishing-photos bug: `drain` deferring to a loop that has
+  // already decided to exit means nobody does the work, and the queue sits there idle
+  // with items in it. The photographer presses the button and nothing happens at all.
+  const store = new MemStore();
+  let fail = true;
+  const q = new UploadQueue(
+    store,
+    { async run() { if (fail) throw new NonRetryableError('bad file', 400); } },
+    { baseMs: 1, maxMs: 2, maxAttempts: 3 }
+  );
+  await q.enqueue(item('w'));
+  await q.drain();
+  expect(store.items.get('w')?.status).toBe('error');
+
+  q.stop(); // e.g. the photographer signed out and back in
+  fail = false;
+  await q.retryAll();
+  expect(q.completed).toBe(1);
+  expect(store.items.size).toBe(0);
+});

@@ -194,8 +194,8 @@ export default {
       const contentType = EXT_TYPES[ext];
       if (!contentType) return badInput(env);
 
-      const key = `events/${eventDate}/${id}.${ext}`;
-      const publicUrl = `${env.PUBLIC_BASE}/${key}`;
+      let key = `events/${eventDate}/${id}.${ext}`;
+      let publicUrl = `${env.PUBLIC_BASE}/${key}`;
 
       const insertRes = await env.DB.prepare(
         `INSERT OR IGNORE INTO photos (id, r2_key, public_url, event_date, original_name, status)
@@ -205,13 +205,31 @@ export default {
         .run();
 
       if ((insertRes.meta.changes ?? 0) === 0) {
-        const existing = await env.DB.prepare(`SELECT status FROM photos WHERE id = ?`)
+        const existing = await env.DB.prepare(
+          `SELECT status, r2_key, public_url FROM photos WHERE id = ?`
+        )
           .bind(id)
-          .first<{ status: string }>();
+          .first<{ status: string; r2_key: string; public_url: string }>();
         // Already confirmed means a previous attempt actually succeeded and only the
         // response was lost. The client treats this as success, not as an error.
         if (existing?.status === 'confirmed') {
-          return json({ error: 'already_confirmed', publicUrl, key }, env, 409);
+          return json({ error: 'already_confirmed', publicUrl: existing.public_url, key: existing.r2_key }, env, 409);
+        }
+        // A retry of a row that was never confirmed, and this attempt may be a different
+        // format: the photographer can change encoder between tries, and doing so retries
+        // the failures. INSERT OR IGNORE leaves the original key in place, so without this
+        // the bytes go up as .jpg while the row still says .webp and /meta then confirms a
+        // photograph whose public URL points at an object that was never written.
+        //
+        // The row follows the upload rather than the other way round: the signature covers
+        // the content-type, so making the upload follow the row would simply be rejected.
+        // A format change can leave one unwritten key behind, which costs nothing.
+        if (existing && existing.r2_key !== key) {
+          await env.DB.prepare(
+            `UPDATE photos SET r2_key = ?, public_url = ? WHERE id = ? AND status = 'pending'`
+          )
+            .bind(key, publicUrl, id)
+            .run();
         }
       }
 

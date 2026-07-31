@@ -256,11 +256,10 @@
     confirming: 'Ολοκληρώνεται'
   };
 
-  async function retryStuck() {
-    // Cancelled first so the request in the air stops holding the queue, then requeued.
-    const ids = stuckItems.map((i) => i.id);
-    for (const id of ids) await queue.cancel(id);
-    for (const id of ids) await queue.retryItem(id);
+  function retryStuck() {
+    // retryMany abandons the request in the air and keeps the photograph. Cancelling first
+    // would delete it, which is the opposite of what the button says.
+    return queue.retryMany(stuckItems.map((i) => i.id));
   }
 
   async function cancelStuck() {
@@ -605,9 +604,7 @@
               </div>
             {:else if isStuck(it)}
               <div class="row-actions">
-                <button class="btn btn-sm" onclick={() => queue.cancel(it.id).then(() => queue.retryItem(it.id))}>
-                  Ξανά
-                </button>
+                <button class="btn btn-sm" onclick={() => queue.retryItem(it.id)}>Ξανά</button>
                 <button class="btn btn-sm btn-danger" onclick={() => queue.cancel(it.id)}>Άκυρο</button>
               </div>
             {/if}

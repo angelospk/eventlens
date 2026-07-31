@@ -101,22 +101,49 @@ export class UploadQueue {
   };
 
   /**
-   * Puts one failed item back in line and restarts the drain. The returned promise resolves
-   * when the drain finishes, so callers that care (tests, scripts) can await the outcome;
-   * the UI fires and forgets.
+   * Puts photographs back in line, whatever state they are in, and restarts the drain.
+   *
+   * Anything currently in the air is abandoned first — that is the whole point for a wedged
+   * upload — but the row itself is kept. Doing this with `cancel` instead would delete the
+   * photograph and then update a row that no longer exists: "try again" would quietly mean
+   * "throw away".
    */
-  async retryItem(id: string) {
-    await this.store.update(id, UploadQueue.RESET);
+  async retryMany(ids: string[]) {
+    for (const id of ids) {
+      const controller = this.inFlight.get(id);
+      if (controller) {
+        // Disowned *before* the abort lands. An attempt only writes its outcome while it
+        // still owns its entry here, so the failure this abort is about to cause cannot
+        // come back a moment later and undo the reset. Waiting for the attempt to unwind
+        // instead would be a guess: nothing bounds how long a stuck one takes.
+        this.inFlight.delete(id);
+        controller.abort(new Error('retry'));
+      }
+      try {
+        await this.store.update(id, UploadQueue.RESET);
+      } catch {
+        // Row is gone or the store is unavailable; nothing to retry.
+      }
+    }
     this.onChange();
+    // The drain may be asleep on a backoff it set before the reset. Without this the
+    // photographer presses "try again" and watches nothing happen for up to half a minute.
+    this.wake?.();
     return this.drain();
+  }
+
+  /**
+   * One item. The returned promise resolves when the drain finishes, so callers that care
+   * (tests, scripts) can await the outcome; the UI fires and forgets.
+   */
+  retryItem(id: string) {
+    return this.retryMany([id]);
   }
 
   /** Same, for every item sitting in 'error' - the "try everything again" button. */
   async retryAll() {
     const failed = (await this.store.all()).filter((i) => i.status === 'error');
-    for (const i of failed) await this.store.update(i.id, UploadQueue.RESET);
-    this.onChange();
-    return this.drain();
+    return this.retryMany(failed.map((i) => i.id));
   }
 
   async discard(id: string) {
@@ -161,14 +188,37 @@ export class UploadQueue {
    */
   drain(): Promise<void> {
     this.stopped = false;
-    if (this.running) {
-      this.dirty = true;
-      return this.active ?? Promise.resolve();
+    // Set unconditionally: a request made while a loop is running is honoured by that loop's
+    // next turn, and a request made as one is finishing starts a new one.
+    this.dirty = true;
+    if (!this.running) {
+      // Claimed synchronously. `loop` does not reach its body until the lock is acquired, so
+      // claiming in there would let two calls in the same tick both start a loop.
+      this.running = true;
+      this.active = this.loop().finally(() => {
+        this.active = null;
+      });
     }
-    this.active = this.run().finally(() => {
-      this.active = null;
-    });
-    return this.active;
+    return this.active ?? Promise.resolve();
+  }
+
+  /**
+   * Owns the running flag for exactly as long as there is work. The flag is cleared in the
+   * same turn as the loop condition fails, with nothing awaited in between, so a `drain`
+   * either sets `dirty` in time to be picked up or finds the queue idle and starts a fresh
+   * loop. Anything less strict and a `stop` followed by a retry leaves the queue dead: the
+   * pass exits early, the retry sees `running` and defers to it, and neither does the work.
+   */
+  private async loop() {
+    try {
+      while (this.dirty && !this.stopped) {
+        this.dirty = false;
+        await this.run();
+      }
+    } finally {
+      this.running = false;
+      this.onChange();
+    }
   }
 
   /**
@@ -191,48 +241,40 @@ export class UploadQueue {
     }
   }
 
+  /** One pass: work through everything runnable until nothing is left to do right now. */
   private async run() {
     // Outside the lock on purpose: this only repairs how things are described, and it has
     // to happen even when another context is doing the uploading.
     await this.reclaimInterrupted();
     await this.withLock(async () => {
-      this.running = true;
-      try {
-        do {
-          this.dirty = false;
-          // Items the store itself refused to touch this pass. Without this the loop would
-          // pick the same unwritable item forever and spin the CPU.
-          const skip = new Set<string>();
-          for (;;) {
-            if (this.stopped) return;
-            const items = (await this.store.all())
-              .filter((i) => isRunnable(i, this.retry.maxAttempts) && !skip.has(i.id))
-              // Fewest attempts first, then oldest.
-              //
-              // Plain oldest-first means one troublesome photograph, an enormous file or one
-              // that keeps timing out, takes the front of the queue on every single pass and
-              // everything shot after it waits behind. Ordering by attempts lets a struggling
-              // photo drift to the back on its own: it is still retried, just after the ones
-              // that have not failed yet. Nothing is skipped, nothing is lost, the healthy
-              // majority simply stops paying for the exception.
-              .sort((a, b) => (a.tries ?? 0) - (b.tries ?? 0) || (a.queuedAt ?? 0) - (b.queuedAt ?? 0));
-            if (items.length === 0) break;
-            const now = Date.now();
-            // Prefer an item whose backoff has elapsed (or never failed).
-            const ready = items.find((i) => !i.nextAttemptAt || i.nextAttemptAt <= now);
-            if (ready) {
-              if (!(await this.process(ready))) skip.add(ready.id);
-              continue;
-            }
-            // All runnable items are still in backoff: wait until the soonest, then loop.
-            // (A newly-enqueued item has no nextAttemptAt, so it would have been 'ready'.)
-            const soonest = Math.min(...items.map((i) => i.nextAttemptAt as number));
-            await this.waitUntil(Math.max(0, soonest - now));
-          }
-        } while (this.dirty && !this.stopped); // an enqueue happened mid-drain → another pass
-      } finally {
-        this.running = false;
-        this.onChange();
+      // Items the store itself refused to touch this pass. Without this the loop would
+      // pick the same unwritable item forever and spin the CPU.
+      const skip = new Set<string>();
+      for (;;) {
+        if (this.stopped) return;
+        const items = (await this.store.all())
+          .filter((i) => isRunnable(i, this.retry.maxAttempts) && !skip.has(i.id))
+          // Fewest attempts first, then oldest.
+          //
+          // Plain oldest-first means one troublesome photograph, an enormous file or one
+          // that keeps timing out, takes the front of the queue on every single pass and
+          // everything shot after it waits behind. Ordering by attempts lets a struggling
+          // photo drift to the back on its own: it is still retried, just after the ones
+          // that have not failed yet. Nothing is skipped, nothing is lost, the healthy
+          // majority simply stops paying for the exception.
+          .sort((a, b) => (a.tries ?? 0) - (b.tries ?? 0) || (a.queuedAt ?? 0) - (b.queuedAt ?? 0));
+        if (items.length === 0) break;
+        const now = Date.now();
+        // Prefer an item whose backoff has elapsed (or never failed).
+        const ready = items.find((i) => !i.nextAttemptAt || i.nextAttemptAt <= now);
+        if (ready) {
+          if (!(await this.process(ready))) skip.add(ready.id);
+          continue;
+        }
+        // All runnable items are still in backoff: wait until the soonest, then loop.
+        // (A newly-enqueued item has no nextAttemptAt, so it would have been 'ready'.)
+        const soonest = Math.min(...items.map((i) => i.nextAttemptAt as number));
+        await this.waitUntil(Math.max(0, soonest - now));
       }
     });
   }
@@ -313,6 +355,10 @@ export class UploadQueue {
         await this.finish(it.id, it.fingerprint, it);
         return true;
       }
+      // Superseded: the photographer asked for this one to start over, so the failure that
+      // request caused is not news. Writing it would put the item straight back into the
+      // error/backoff state the retry just cleared.
+      if (this.inFlight.get(it.id) !== controller) return true;
       const networky = isNetworkError(e);
       this.netFails = networky ? this.netFails + 1 : 0;
       // A failure to reach the server says nothing about the photo, so it must not consume
@@ -338,7 +384,9 @@ export class UploadQueue {
       this.onChange();
       return true;
     } finally {
-      this.inFlight.delete(it.id);
+      // Only if this attempt is still the current one: a retry may have already handed the
+      // slot to a newer attempt, and clearing it here would disown that one instead.
+      if (this.inFlight.get(it.id) === controller) this.inFlight.delete(it.id);
     }
   }
 
@@ -347,8 +395,9 @@ export class UploadQueue {
    * Used for something that is clearly not going to arrive, so the rest can move.
    */
   async cancel(id: string) {
-    this.inFlight.get(id)?.abort(new Error('cancelled'));
+    const controller = this.inFlight.get(id);
     this.inFlight.delete(id);
+    controller?.abort(new Error('cancelled'));
     try {
       await this.store.remove(id);
     } catch {
