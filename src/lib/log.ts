@@ -16,6 +16,8 @@ const KEY = 'eventlens.log.v1';
 const CAPACITY = 600;
 /** Writes are batched: a burst of thirty photographs must not be thirty storage writes. */
 const FLUSH_MS = 1500;
+/** Within this, the same line twice is a loop repeating, not two things happening. */
+const REPEAT_MS = 2000;
 
 export interface LogEntry {
   t: number;
@@ -24,6 +26,8 @@ export interface LogEntry {
 }
 
 let buffer: LogEntry[] = [];
+/** The last time each distinct line was written, so a burst of one line stays one line. */
+const repeats = new Map<string, { entry: LogEntry; at: number; n: number }>();
 let loaded = false;
 let timer: ReturnType<typeof setTimeout> | null = null;
 let listener: (() => void) | null = null;
@@ -73,7 +77,24 @@ function flush() {
  */
 export function log(tag: string, msg: string) {
   load();
-  buffer.push({ t: Date.now(), tag, msg });
+  const now = Date.now();
+  const key = `${tag}|${msg}`;
+  const seen = repeats.get(key);
+  // A line repeating many times a second is a loop, not evidence, and six hundred of them
+  // would push out the handful of lines that actually explain what happened. So a repeat
+  // inside the window counts up on the line already there instead of writing a new one.
+  if (seen && now - seen.at < REPEAT_MS && buffer.includes(seen.entry)) {
+    seen.at = now;
+    seen.n++;
+    seen.entry.msg = `${msg} ×${seen.n}`;
+    listener?.();
+    if (!timer) timer = setTimeout(flush, FLUSH_MS);
+    return;
+  }
+  const entry = { t: now, tag, msg };
+  repeats.set(key, { entry, at: now, n: 1 });
+  if (repeats.size > CAPACITY) repeats.clear(); // bounded; the buffer is the record, not this
+  buffer.push(entry);
   if (buffer.length > CAPACITY) buffer.splice(0, buffer.length - CAPACITY);
   listener?.();
   if (!timer) timer = setTimeout(flush, FLUSH_MS);
@@ -99,6 +120,7 @@ export function entries(): LogEntry[] {
 
 export function clearLog() {
   buffer = [];
+  repeats.clear();
   loaded = true;
   flushNow();
   listener?.();

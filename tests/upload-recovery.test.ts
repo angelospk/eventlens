@@ -637,3 +637,33 @@ test('a retry asked for while the queue is winding down still runs', async () =>
   expect(q.completed).toBe(1);
   expect(store.items.size).toBe(0);
 });
+
+test('a storage failure that aborts is not mistaken for the queue being stopped', async () => {
+  // `locks.request` adopts whatever the callback returns, so an AbortError thrown by
+  // IndexedDB inside the work arrives at the same catch as an aborted *wait* for the lock.
+  // Treating it as a stop ended the pass with every photograph still pending and nothing
+  // anywhere saying why — the exact silence that took a night to diagnose.
+  const store = new MemStore();
+  const aborted = new Error('the transaction was aborted');
+  aborted.name = 'AbortError';
+  const failing = {
+    ...store,
+    add: (it: QueueItem) => store.add(it),
+    update: (id: string, p: Partial<QueueItem>) => store.update(id, p),
+    remove: (id: string) => store.remove(id),
+    async all(): Promise<QueueItem[]> {
+      throw aborted;
+    }
+  };
+  const queue = new UploadQueue(
+    failing,
+    { async run() {} },
+    { baseMs: 1, maxMs: 4, maxAttempts: 3 }
+  );
+
+  await withGlobals({ navigator: serialLocks() }, async () => {
+    // It has to come out as a failure. Swallowed, the caller cannot tell this apart from
+    // an orderly stop with nothing left to do.
+    expect(queue.drain()).rejects.toThrow('the transaction was aborted');
+  });
+});

@@ -33,6 +33,18 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 /** How long the lock may be out of reach before that becomes something worth saying. */
 const LOCK_WARN_MS = 15_000;
+/** The same, for a storage operation that has gone quiet rather than failed. */
+const STALL_WARN_MS = 10_000;
+
+/**
+ * Notes in the log that something has taken suspiciously long, and stops watching when it
+ * finishes. For the operations that can hang rather than fail — the ones that leave no
+ * exception to catch and so used to leave no trace either.
+ */
+function watchStall(what: string, ms = STALL_WARN_MS): () => void {
+  const timer = setTimeout(() => log('queue', `${what} (${Math.round(ms / 1000)}s and counting)`), ms);
+  return () => clearTimeout(timer);
+}
 
 // Runnable = waiting to be tried, or left mid-flight by a crash/reload.
 // 'error' items are NOT auto-retried (manual retry only); 'done' are removed.
@@ -213,24 +225,38 @@ export class UploadQueue {
       log('queue', 'waiting for the upload lock — the app is open somewhere else');
       this.onChange();
     }, LOCK_WARN_MS);
+    // Whether we ever got in. Everything below turns on this: an abort before the callback
+    // ran is a stop, and the same abort after it ran came from the work itself.
+    let acquired = false;
     const clear = () => {
       clearTimeout(watchdog);
-      if (this._blocked) {
-        this._blocked = false;
+      if (!this._blocked) return;
+      this._blocked = false;
+      // Only the successful path gets to announce a wait that ended. Clearing the flag on
+      // the way out of an abandoned wait still has to happen, or the screen keeps saying
+      // "open somewhere else" long after nothing is waiting for anything.
+      if (acquired) {
         log('queue', `got the upload lock after ${Math.round((Date.now() - asked) / 1000)}s`);
-        this.onChange();
       }
+      this.onChange();
     };
     try {
       return (await locks.request('eventlens-upload', { signal: this.locking.signal }, () => {
+        acquired = true;
         clear();
         return fn();
       })) as T;
     } catch (e) {
-      if ((e as Error)?.name === 'AbortError') return null;
+      // Aborts are only ours to swallow before the lock was granted. `locks.request` adopts
+      // whatever the callback returns, so an AbortError from an IndexedDB request inside
+      // the work arrives here looking identical to a `stop()` — and returning null for it
+      // would tell `run` the queue was stopped, ending the pass with every photograph still
+      // pending and not one word about why. That is the exact silence this whole change
+      // exists to remove.
+      if (!acquired && (e as Error)?.name === 'AbortError') return null;
       throw e;
     } finally {
-      clearTimeout(watchdog);
+      clear();
       this.locking = null;
     }
   }
@@ -331,7 +357,17 @@ export class UploadQueue {
           await this.reclaimInterrupted();
           repaired = true;
         }
-        const all = await this.store.all();
+        // The lock is held from here. A store operation that never settles now stalls the
+        // drain from *inside*, which produced no log line at all: the watchdog above has
+        // already been cleared, `running` stays true, and every later drain quietly joins
+        // the run that is stuck. So the read gets its own watch.
+        const settled = watchStall('the queue is not answering from storage');
+        let all: QueueItem[];
+        try {
+          all = await this.store.all();
+        } finally {
+          settled();
+        }
         const items = all
           .filter((i) => isRunnable(i, this.retry.maxAttempts) && !skip.has(i.id))
           // Fewest attempts first, then oldest.
@@ -354,7 +390,17 @@ export class UploadQueue {
               return acc;
             }, {});
             const shape = Object.entries(by).map(([k, v]) => `${k}=${v}`).join(' ');
-            log('queue', `nothing to run · ${shape}${skip.size ? ` skipped=${skip.size}` : ''}`);
+            // The status alone would not explain it: a row can read 'pending' and still be
+            // ineligible, which is the one combination that looks like the queue ignoring
+            // work for no reason. So the two things that do that are counted by name.
+            const exhausted = all.filter(
+              (i) => (i.status === 'pending' || i.status === 'uploading') && i.attempts >= this.retry.maxAttempts
+            ).length;
+            const why = [
+              exhausted ? `out of attempts=${exhausted}` : '',
+              skip.size ? `unwritable=${skip.size}` : ''
+            ].filter(Boolean).join(' ');
+            log('queue', `nothing to run · ${shape}${why ? ` · ${why}` : ''}`);
           }
           return -1;
         }

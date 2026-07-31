@@ -61,7 +61,9 @@ class Uploads {
     this.watching = true;
     const resume = (why: string) => {
       log('app', `resuming uploads: ${why}`);
-      void this.queue?.resume();
+      this.queue?.resume().catch((e) => {
+        log('queue', `resume failed: ${e instanceof Error ? e.message : String(e)}`);
+      });
     };
     window.addEventListener('online', () => resume('the network came back'));
     // Mobile browsers freeze timers while a tab is hidden, so a backoff started before the
@@ -103,7 +105,13 @@ class Uploads {
     await this.refresh();
     if (mine !== this.generation) return;
     this.watch();
-    queue.drain(); // resume anything left from a previous session
+    // Resume anything left from a previous session. The rejection is caught rather than
+    // left to become an unhandled promise: a drain that dies on the way up is exactly the
+    // case where the photographer sees a full queue doing nothing, and the reason for it
+    // belongs in the log rather than in a console nobody on a phone can open.
+    queue.drain().catch((e) => {
+      log('queue', `the drain stopped on start-up: ${e instanceof Error ? e.message : String(e)}`);
+    });
   }
 
   async refresh() {

@@ -303,7 +303,9 @@
           : `${duplicates} από ${chosen} είχαν σταλεί ήδη και παραλείφθηκαν.`
         : '';
       await refresh();
-      queue.drain();
+      queue.drain().catch((e) => {
+        log('queue', `the drain stopped after picking: ${e instanceof Error ? e.message : String(e)}`);
+      });
     }
   }
 
