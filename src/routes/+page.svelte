@@ -30,6 +30,16 @@
   let unverified = $state(false);
   // True when the queue lives only in memory because the database would not open.
   let ephemeral = $state(false);
+  // Ticks only while something is uploading, so a wedged attempt turns into an offer of
+  // help on its own rather than sitting there looking busy.
+  let nowTick = $state(Date.now());
+  // How long an attempt may run before the interface stops calling it progress. Requests
+  // already abort themselves well before this; a photograph still here after it is one the
+  // photographer should be able to take into their own hands.
+  const STUCK_AFTER_MS = 25_000;
+  const isStuck = (it: QueueItem) =>
+    it.status === 'uploading' && !!it.startedAt && nowTick - it.startedAt > STUCK_AFTER_MS;
+  const stuckItems = $derived(items.filter(isStuck));
   let doctorOpen = $state(false);
   let doctorRunning = $state(false);
   let doctor = $state<Diagnosis | null>(null);
@@ -44,6 +54,9 @@
   // night of shooting does not leak hundreds of blobs.
   let thumbs = $state<Record<string, string>>({});
   let pickError = $state('');
+  // The most recent photograph to land, kept so the first question on reopening the app
+  // ("where did I get to") has an answer that a running total cannot give.
+  let lastDone = $state<{ name: string; at: number; url: string } | null>(null);
   let skipped = $state('');
 
   // Recomputed on every tick rather than frozen at mount: an app left open across midnight
@@ -76,6 +89,13 @@
     items = list;
     completed = queue?.completed ?? 0;
     struggling = queue?.struggling ?? false;
+    const done = queue?.lastDone;
+    if (done && done.at !== lastDone?.at) {
+      // Exactly one preview is held at a time; the previous one is released here rather
+      // than accumulating a night's worth of object URLs.
+      if (lastDone) URL.revokeObjectURL(lastDone.url);
+      lastDone = { name: done.name, at: done.at, url: URL.createObjectURL(done.file) };
+    }
     if (!items.some((i) => i.id === stage?.id)) stage = null;
     // The first request that gets through exchanges the passcode for a token, which
     // retroactively confirms an offline sign-in.
@@ -150,6 +170,8 @@
     // previous photographer's queue and the object URLs behind it are never released.
     for (const url of Object.values(thumbs)) URL.revokeObjectURL(url);
     thumbs = {};
+    if (lastDone) URL.revokeObjectURL(lastDone.url);
+    lastDone = null;
     items = [];
     completed = 0;
     pickError = '';
@@ -221,8 +243,20 @@
     confirming: 'Ολοκληρώνεται'
   };
 
+  async function retryStuck() {
+    // Cancelled first so the request in the air stops holding the queue, then requeued.
+    const ids = stuckItems.map((i) => i.id);
+    for (const id of ids) await queue.cancel(id);
+    for (const id of ids) await queue.retryItem(id);
+  }
+
+  async function cancelStuck() {
+    for (const id of stuckItems.map((i) => i.id)) await queue.cancel(id);
+  }
+
   function statusLabel(it: QueueItem) {
     if (it.status === 'error') return { text: 'Δεν στάλθηκε', cls: 'chip-danger' };
+    if (isStuck(it)) return { text: 'Αργεί πολύ', cls: 'chip-warn' };
     if (it.status === 'uploading') {
       // Naming the step matters on a slow link: a photo can sit on "sending" for a minute
       // and the photographer needs to see movement, not wonder whether it is stuck.
@@ -260,6 +294,11 @@
     const onVisible = () => {
       if (document.visibilityState === 'visible') void queue?.resume();
     };
+    // Only runs while something is in flight: no timer burning battery on an idle screen.
+    const tick = setInterval(() => {
+      if (items.some((i) => i.status === 'uploading')) nowTick = Date.now();
+    }, 2000);
+
     window.addEventListener('online', goOnline);
     window.addEventListener('offline', goOffline);
     document.addEventListener('visibilitychange', onVisible);
@@ -280,6 +319,7 @@
     if (session.restore()) start();
 
     return () => {
+      clearInterval(tick);
       window.removeEventListener('online', goOnline);
       window.removeEventListener('offline', goOffline);
       document.removeEventListener('visibilitychange', onVisible);
@@ -469,6 +509,31 @@
       <p class="skipped">{skipped}</p>
     {/if}
 
+    {#if lastDone}
+      <div class="last-done">
+        <img src={lastDone.url} alt="" />
+        <div>
+          <span class="last-name">{lastDone.name}</span>
+          <span class="hint">
+            Τελευταία που ανέβηκε, {new Date(lastDone.at).toLocaleTimeString('el-GR', {
+              hour: '2-digit',
+              minute: '2-digit'
+            })}
+          </span>
+        </div>
+      </div>
+    {/if}
+
+    {#if stuckItems.length > 0}
+      <div class="retry-bar">
+        <span class="hint">{stuckItems.length} αργούν πολύ.</span>
+        <span style="display:flex;gap:.4rem">
+          <button class="btn btn-sm" onclick={retryStuck}>Ξανά όλες</button>
+          <button class="btn btn-sm btn-danger" onclick={cancelStuck}>Άκυρο όλες</button>
+        </span>
+      </div>
+    {/if}
+
     {#if failed.length > 0}
       <div class="retry-bar">
         <span class="error">
@@ -510,6 +575,13 @@
                 <button class="btn btn-sm" onclick={() => queue.retryItem(it.id)}>Ξανά</button>
                 <button class="btn btn-sm btn-danger" onclick={() => queue.discard(it.id)}>Διαγραφή</button>
               </div>
+            {:else if isStuck(it)}
+              <div class="row-actions">
+                <button class="btn btn-sm" onclick={() => queue.cancel(it.id).then(() => queue.retryItem(it.id))}>
+                  Ξανά
+                </button>
+                <button class="btn btn-sm btn-danger" onclick={() => queue.cancel(it.id)}>Άκυρο</button>
+              </div>
             {/if}
           </li>
         {/each}
@@ -519,6 +591,42 @@
 </div>
 
 <style>
+  .last-done {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    padding: 0.55rem 0.7rem;
+    margin-bottom: 1rem;
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: var(--r-card);
+  }
+
+  .last-done img {
+    width: 38px;
+    height: 38px;
+    object-fit: cover;
+    border-radius: var(--r-input);
+    flex: none;
+  }
+
+  .last-done div {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+  }
+
+  .last-name {
+    font-size: 0.82rem;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .last-done .hint {
+    font-size: 0.74rem;
+  }
+
   .doctor {
     margin-bottom: 1.25rem;
   }

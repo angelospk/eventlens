@@ -16,8 +16,14 @@ export interface QueueStore {
 }
 
 export interface Uploader {
-  // Process (logo+filter+AVIF) and upload one item. Throws on failure.
-  run(item: QueueItem): Promise<void>;
+  /**
+   * Process and upload one item. Throws on failure.
+   *
+   * The signal lets the photographer abandon a photograph that is going nowhere. Without
+   * it, "cancel" could only delete the row while the request carried on in the background
+   * and the queue stayed blocked behind it.
+   */
+  run(item: QueueItem, signal?: AbortSignal): Promise<void>;
 }
 
 export interface RetryPolicy { baseMs: number; maxMs: number; maxAttempts: number; }
@@ -34,6 +40,9 @@ export class UploadQueue {
   private running = false;
   private dirty = false;
   private active: Promise<void> | null = null;
+  // One controller per photograph currently being uploaded, so a single one can be
+  // abandoned without disturbing the rest of the queue.
+  private inFlight = new Map<string, AbortController>();
   // Consecutive failures caused by the network rather than by the server or the file.
   // `navigator.onLine` cannot see a hotspot that answers DHCP and nothing else, which is
   // the normal state of a field full of people, so the truth comes from real attempts.
@@ -43,6 +52,7 @@ export class UploadQueue {
   private wake: (() => void) | null = null;
   private stopped = false;
   private _completed = 0;
+  private _lastDone: { name: string; at: number; file: Blob } | null = null;
   constructor(
     private store: QueueStore,
     private uploader: Uploader,
@@ -52,6 +62,9 @@ export class UploadQueue {
 
   /** Number of items successfully uploaded this session (they are removed from the store). */
   get completed() { return this._completed; }
+
+  /** The most recent photograph to reach the server, for "where did I get to". */
+  get lastDone() { return this._lastDone; }
 
   /**
    * True once the network has failed us repeatedly. One failure is noise; two in a row
@@ -231,23 +244,27 @@ export class UploadQueue {
 
   private async process(it: QueueItem): Promise<boolean> {
     const tries = (it.tries ?? 0) + 1;
+    const controller = new AbortController();
+    this.inFlight.set(it.id, controller);
     try {
-      await this.store.update(it.id, { status: 'uploading', tries });
+      // startedAt is what the interface reads to tell "working on it" apart from "wedged".
+      await this.store.update(it.id, { status: 'uploading', tries, startedAt: Date.now() });
     } catch {
+      this.inFlight.delete(it.id);
       return false; // storage is unavailable (tab closing, quota); leave it for next open
     }
     this.onChange();
     try {
-      await this.uploader.run(it);
+      await this.uploader.run(it, controller.signal);
       this.netFails = 0;
-      await this.finish(it.id, it.fingerprint);
+      await this.finish(it.id, it.fingerprint, it);
       return true;
     } catch (e) {
       // The server already has it: count it as done rather than scaring the photographer
       // with a failure for a photo that is actually up.
       if (isAlreadyUploaded(e)) {
         this.netFails = 0;
-        await this.finish(it.id, it.fingerprint);
+        await this.finish(it.id, it.fingerprint, it);
         return true;
       }
       const networky = isNetworkError(e);
@@ -274,7 +291,24 @@ export class UploadQueue {
       }
       this.onChange();
       return true;
+    } finally {
+      this.inFlight.delete(it.id);
     }
+  }
+
+  /**
+   * Abandons one photograph: aborts the request if it is in the air, and drops the row.
+   * Used for something that is clearly not going to arrive, so the rest can move.
+   */
+  async cancel(id: string) {
+    this.inFlight.get(id)?.abort(new Error('cancelled'));
+    this.inFlight.delete(id);
+    try {
+      await this.store.remove(id);
+    } catch {
+      // Nothing more to do; it is gone from view either way.
+    }
+    this.onChange();
   }
 
   /**
@@ -282,7 +316,11 @@ export class UploadQueue {
    * deleted, it is at least marked 'done' so the drain stops treating it as work: without
    * that the same photo is uploaded again on every pass until it burns through maxAttempts.
    */
-  private async finish(id: string, fingerprint?: string) {
+  private async finish(id: string, fingerprint?: string, item?: QueueItem) {
+    // Remembered so the interface can show what went up last. Coming back to the app after
+    // a break, the first question is always "where did I get to", and a count alone does
+    // not answer it.
+    if (item) this._lastDone = { name: item.originalName, at: Date.now(), file: item.file };
     if (fingerprint) {
       // Recorded before the row is dropped: if the delete fails, the photograph is still
       // known to have been sent and will not be queued again.

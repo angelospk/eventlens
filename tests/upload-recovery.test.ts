@@ -448,3 +448,67 @@ test('a successful thumbnail is reported so the gallery can use it', async () =>
   expect(seen).toContain('https://r2/thumb');
   expect(metaBody.hasThumb).toBe(true);
 });
+
+test('a request that never answers is abandoned instead of hanging the queue', async () => {
+  // The reported failure: a photograph sits on "uploading" and nothing else moves. Without
+  // a deadline the fetch simply never settles, so the drain waits behind it forever.
+  const store = new MemStore();
+  let aborted = false;
+  const uploader = {
+    async run(_it: QueueItem, signal?: AbortSignal) {
+      await new Promise((_res, rej) => {
+        signal?.addEventListener('abort', () => { aborted = true; rej(new Error('aborted')); });
+      });
+    }
+  };
+  const q = new UploadQueue(store, uploader, { baseMs: 1, maxMs: 4, maxAttempts: 2 });
+  await q.enqueue(item('hangs'));
+
+  const draining = q.drain();
+  await new Promise((r) => setTimeout(r, 20));
+
+  // The photographer gives up on it; the queue must come back to life.
+  await q.cancel('hangs');
+  await draining;
+
+  expect(aborted).toBe(true);
+  expect(await store.all()).toEqual([]);
+});
+
+test('cancelling one wedged photograph lets the rest of the queue through', async () => {
+  const store = new MemStore();
+  const uploaded: string[] = [];
+  const uploader = {
+    async run(it: QueueItem, signal?: AbortSignal) {
+      if (it.id === 'wedged') {
+        await new Promise((_res, rej) =>
+          signal?.addEventListener('abort', () => rej(new Error('aborted')))
+        );
+        return;
+      }
+      uploaded.push(it.id);
+    }
+  };
+  const q = new UploadQueue(store, uploader, { baseMs: 1, maxMs: 4, maxAttempts: 2 });
+  await q.enqueue({ ...item('wedged'), queuedAt: 1 });
+  await q.enqueue({ ...item('healthy'), queuedAt: 2 });
+
+  const draining = q.drain();
+  await new Promise((r) => setTimeout(r, 20));
+  await q.cancel('wedged');
+  await draining;
+
+  expect(uploaded).toEqual(['healthy']);
+  expect(await store.all()).toEqual([]);
+});
+
+test('an upload records what went up last, for "where did I get to"', async () => {
+  const store = new MemStore();
+  const q = new UploadQueue(store, { async run() {} }, { baseMs: 1, maxMs: 4, maxAttempts: 2 });
+  await q.enqueue({ ...item('first'), queuedAt: 1 });
+  await q.enqueue({ ...item('second'), queuedAt: 2 });
+  await q.drain();
+
+  expect(q.lastDone?.name).toBe('second.jpg');
+  expect(q.lastDone?.at).toBeGreaterThan(0);
+});

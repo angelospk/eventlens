@@ -38,6 +38,8 @@ export interface QueueItem {
   // is a uuid, so without this the queue uploads in effectively random order and the wall
   // shows the night out of sequence.
   queuedAt?: number;
+  /** When the current attempt began, so a wedged upload can be told from a busy one. */
+  startedAt?: number;
   lastError?: string;
   nextAttemptAt?: number; // epoch ms; item is not retried before this (backoff without blocking the queue)
   // populated after processing:

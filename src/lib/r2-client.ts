@@ -15,6 +15,42 @@ export interface R2UploaderDeps {
   onStage?: (id: string, stage: Stage) => void;
 }
 
+/**
+ * How long a single request may hang before it is treated as failed.
+ *
+ * Without these, a request on a flaky radio simply never settles: the photograph sits at
+ * "uploading" forever, the queue waits behind it, and nothing in the interface is wrong
+ * enough to explain why. Aborting turns a hang into an ordinary retry, which the queue
+ * already knows how to survive.
+ *
+ * The upload of the photograph itself gets far longer than the small JSON calls, because
+ * it is the only one carrying real bytes over the venue's connection.
+ */
+const CALL_TIMEOUT_MS = 20_000;
+const UPLOAD_TIMEOUT_MS = 90_000;
+
+/**
+ * A signal that fires on the timeout OR when the photographer abandons the photograph.
+ * `AbortSignal.timeout` and `AbortSignal.any` are both missing from older Safari, so the
+ * two are combined by hand.
+ */
+function deadline(ms: number, external?: AbortSignal): AbortSignal {
+  const c = new AbortController();
+  const timer = setTimeout(() => c.abort(new Error('timeout')), ms);
+  const stop = () => {
+    clearTimeout(timer);
+    c.abort(external?.reason ?? new Error('cancelled'));
+  };
+  if (external) {
+    if (external.aborted) stop();
+    else external.addEventListener('abort', stop, { once: true });
+  }
+  // Once the request settles the timer is irrelevant; letting it run would abort a
+  // controller nobody is listening to, which is harmless but noisy in a profiler.
+  c.signal.addEventListener('abort', () => clearTimeout(timer), { once: true });
+  return c.signal;
+}
+
 export function makeR2Uploader(deps: R2UploaderDeps): Uploader {
   const rawFetch = deps.fetchImpl ?? fetch;
 
@@ -37,7 +73,7 @@ export function makeR2Uploader(deps: R2UploaderDeps): Uploader {
     ((file: Blob, mime: string) => import('./processor').then((m) => m.processImage(file, mime)));
 
   return {
-    async run(item: QueueItem) {
+    async run(item: QueueItem, signal?: AbortSignal) {
       // Resolved per attempt rather than captured once: a retry hours later must not send
       // a token that expired while the photo sat in the queue.
       stage(item.id, 'preparing');
@@ -54,6 +90,7 @@ export function makeR2Uploader(deps: R2UploaderDeps): Uploader {
       stage(item.id, 'preparing');
       const signRes = await f(`${deps.workerUrl}/sign`, {
         method: 'POST',
+        signal: deadline(CALL_TIMEOUT_MS, signal),
         headers: { ...auth, 'content-type': 'application/json' },
         body: JSON.stringify({
           id: item.id,
@@ -80,6 +117,7 @@ export function makeR2Uploader(deps: R2UploaderDeps): Uploader {
       stage(item.id, 'sending');
       const put = await f(uploadUrl, {
         method: 'PUT',
+        signal: deadline(UPLOAD_TIMEOUT_MS, signal),
         // Must match what was signed byte for byte, so the signed format wins.
         headers: { 'content-type': fmt.mime },
         body: out.blob
@@ -95,6 +133,7 @@ export function makeR2Uploader(deps: R2UploaderDeps): Uploader {
         try {
           const putThumb = await f(thumbUploadUrl, {
             method: 'PUT',
+            signal: deadline(CALL_TIMEOUT_MS, signal),
             headers: { 'content-type': fmt.mime },
             body: out.thumb
           });
@@ -114,6 +153,7 @@ export function makeR2Uploader(deps: R2UploaderDeps): Uploader {
       stage(item.id, 'confirming');
       const metaRes = await f(`${deps.workerUrl}/meta`, {
         method: 'POST',
+        signal: deadline(CALL_TIMEOUT_MS, signal),
         headers: { ...auth, 'content-type': 'application/json' },
         body: JSON.stringify(meta)
       });
