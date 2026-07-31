@@ -68,6 +68,24 @@
     lightboxIndex = (lightboxIndex + step + ordered.length) % ordered.length;
   }
 
+  /**
+   * The two photographs either side of the one being looked at.
+   *
+   * The grid shows thumbnails; the lightbox shows the full photograph, so every arrow press
+   * starts a download from cold and the screen sits on the old picture while it arrives.
+   * Fetching the neighbours while the current one is being looked at spends that wait on
+   * time the viewer is already spending. Only two, and only with the lightbox open: a
+   * whole night of full-size photographs is not something to pull down over event Wi-Fi.
+   */
+  const neighbours = $derived.by(() => {
+    if (lightboxIndex === null || ordered.length < 2) return [];
+    const n = ordered.length;
+    const urls = [ordered[(lightboxIndex + 1) % n], ordered[(lightboxIndex - 1 + n) % n]]
+      .map((p) => p?.public_url)
+      .filter((u): u is string => Boolean(u) && u !== ordered[lightboxIndex!]?.public_url);
+    return [...new Set(urls)];
+  });
+
   function onKey(e: KeyboardEvent) {
     if (lightboxIndex === null) return;
     if (e.key === 'Escape') lightboxIndex = null;
@@ -117,6 +135,9 @@
 <svelte:head>
   <title>{heading}</title>
   <meta name="description" content="Οι φωτογραφίες της βραδιάς." />
+  {#each neighbours as url (url)}
+    <link rel="preload" as="image" href={url} />
+  {/each}
 </svelte:head>
 
 <svelte:window onkeydown={onKey} />
