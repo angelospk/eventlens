@@ -116,6 +116,8 @@
 		<span class="text">
 			{#if uploads.activeId}
 				Ανεβάζει {busyName || 'φωτογραφία'}
+			{:else if uploads.blocked}
+				Ανοιχτό αλλού
 			{:else if uploads.struggling}
 				Περιμένει δίκτυο
 			{:else}

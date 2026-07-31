@@ -31,6 +31,9 @@ export interface RetryPolicy { baseMs: number; maxMs: number; maxAttempts: numbe
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
+/** How long the lock may be out of reach before that becomes something worth saying. */
+const LOCK_WARN_MS = 15_000;
+
 // Runnable = waiting to be tried, or left mid-flight by a crash/reload.
 // 'error' items are NOT auto-retried (manual retry only); 'done' are removed.
 function isRunnable(i: QueueItem, maxAttempts: number): boolean {
@@ -56,6 +59,8 @@ export class UploadQueue {
   private locking: AbortController | null = null;
   private _completed = 0;
   private _lastDone: { name: string; at: number; file: Blob } | null = null;
+  /** Set while the lock has been out of reach long enough that it needs explaining. */
+  private _blocked = false;
   constructor(
     private store: QueueStore,
     private uploader: Uploader,
@@ -86,6 +91,13 @@ export class UploadQueue {
    * means the photographer should be told the connection is the problem, not their photos.
    */
   get struggling() { return this.netFails >= 2; }
+
+  /**
+   * True when this queue has been waiting on the cross-context lock long enough that the
+   * only honest explanation is another window. Uploading looks identical to being wedged
+   * from the outside — nothing moves, nothing errors — so it has to be said out loud.
+   */
+  get blocked() { return this._blocked; }
 
   /**
    * Adds a photograph unless it is already here or already sent.
@@ -192,12 +204,33 @@ export class UploadQueue {
     // lock another window holds never settles its drain, `running` stays true for good,
     // and every later request to upload quietly defers to a loop that will never run.
     this.locking = new AbortController();
+    const asked = Date.now();
+    // Waiting on a lock is indistinguishable from being wedged: no progress, no error, no
+    // log line. If it goes on this long, something else is holding it and the photographer
+    // deserves to be told which of the two is happening.
+    const watchdog = setTimeout(() => {
+      this._blocked = true;
+      log('queue', 'waiting for the upload lock — the app is open somewhere else');
+      this.onChange();
+    }, LOCK_WARN_MS);
+    const clear = () => {
+      clearTimeout(watchdog);
+      if (this._blocked) {
+        this._blocked = false;
+        log('queue', `got the upload lock after ${Math.round((Date.now() - asked) / 1000)}s`);
+        this.onChange();
+      }
+    };
     try {
-      return (await locks.request('eventlens-upload', { signal: this.locking.signal }, fn)) as T;
+      return (await locks.request('eventlens-upload', { signal: this.locking.signal }, () => {
+        clear();
+        return fn();
+      })) as T;
     } catch (e) {
       if ((e as Error)?.name === 'AbortError') return null;
       throw e;
     } finally {
+      clearTimeout(watchdog);
       this.locking = null;
     }
   }
@@ -218,6 +251,7 @@ export class UploadQueue {
     // the picker closing and nothing appearing to happen.
     this.wake?.();
     if (!this.running) {
+      log('queue', 'drain starting');
       // Claimed synchronously. `loop` does not reach its body until the lock is acquired, so
       // claiming in there would let two calls in the same tick both start a loop.
       this.running = true;
@@ -239,8 +273,18 @@ export class UploadQueue {
     try {
       while (this.dirty && !this.stopped) {
         this.dirty = false;
-        await this.run();
+        try {
+          await this.run();
+        } catch (e) {
+          // A pass can only throw if the store itself failed in a way `run` does not
+          // handle. Letting it escape would end the loop with every photograph still
+          // 'pending' and nothing anywhere saying why — which is precisely the failure
+          // that took a night to find. Say it, then stop trying this pass.
+          log('queue', `drain pass threw: ${e instanceof Error ? e.message : String(e)}`);
+          throw e;
+        }
       }
+      log('queue', 'drain finished');
     } finally {
       this.running = false;
       this.onChange();
@@ -287,7 +331,8 @@ export class UploadQueue {
           await this.reclaimInterrupted();
           repaired = true;
         }
-        const items = (await this.store.all())
+        const all = await this.store.all();
+        const items = all
           .filter((i) => isRunnable(i, this.retry.maxAttempts) && !skip.has(i.id))
           // Fewest attempts first, then oldest.
           //
@@ -298,12 +343,29 @@ export class UploadQueue {
           // that have not failed yet. Nothing is skipped, nothing is lost, the healthy
           // majority simply stops paying for the exception.
           .sort((a, b) => (a.tries ?? 0) - (b.tries ?? 0) || (a.queuedAt ?? 0) - (b.queuedAt ?? 0));
-        if (items.length === 0) return -1;
+        if (items.length === 0) {
+          // The one outcome that used to leave no trace at all. A queue full of
+          // photographs and nothing runnable in it means they were skipped, exhausted or
+          // already failed — all of which look identical on screen, and none of which the
+          // photographer can act on without being told which.
+          if (all.length) {
+            const by = all.reduce<Record<string, number>>((acc, i) => {
+              acc[i.status] = (acc[i.status] ?? 0) + 1;
+              return acc;
+            }, {});
+            const shape = Object.entries(by).map(([k, v]) => `${k}=${v}`).join(' ');
+            log('queue', `nothing to run · ${shape}${skip.size ? ` skipped=${skip.size}` : ''}`);
+          }
+          return -1;
+        }
         const now = Date.now();
         // Prefer an item whose backoff has elapsed (or never failed).
         const ready = items.find((i) => !i.nextAttemptAt || i.nextAttemptAt <= now);
         if (ready) {
-          if (!(await this.process(ready))) skip.add(ready.id);
+          if (!(await this.process(ready))) {
+            log('queue', `${ready.id.slice(0, 8)} ${ready.originalName}: storage refused the write`);
+            skip.add(ready.id);
+          }
           return 0;
         }
         // Everything runnable is still in backoff: report how long, and wait for it with
@@ -313,7 +375,9 @@ export class UploadQueue {
         // minimum and turn the wait into a busy loop.
         const times = items.map((i) => i.nextAttemptAt as number).filter(Number.isFinite);
         if (!times.length) return 250;
-        return Math.max(0, Math.min(...times) - now);
+        const ms = Math.max(0, Math.min(...times) - now);
+        log('queue', `all ${items.length} waiting out a backoff · ${Math.round(ms / 1000)}s`);
+        return ms;
       });
       if (wait === null || wait < 0) return; // stopped, or nothing left to do
       if (wait > 0) await this.waitUntil(wait);
@@ -376,6 +440,7 @@ export class UploadQueue {
     const tries = (it.tries ?? 0) + 1;
     const controller = new AbortController();
     this.inFlight.set(it.id, controller);
+    log('queue', `picking ${it.id.slice(0, 8)} ${it.originalName} try ${tries}`);
     try {
       // startedAt is what the interface reads to tell "working on it" apart from "wedged".
       await this.store.update(it.id, { status: 'uploading', tries, startedAt: Date.now() });

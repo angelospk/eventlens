@@ -24,6 +24,8 @@ class Uploads {
   items = $state<QueueItem[]>([]);
   completed = $state(0);
   struggling = $state(false);
+  /** The queue is alive but another window is holding the lock. */
+  blocked = $state(false);
   ephemeral = $state(false);
   /** The photograph actually in flight, as opposed to one a stale row merely claims is. */
   activeId = $state<string | null>(null);
@@ -115,6 +117,7 @@ class Uploads {
       .sort((a, b) => (a.queuedAt ?? 0) - (b.queuedAt ?? 0));
     this.completed = this.queue?.completed ?? 0;
     this.struggling = this.queue?.struggling ?? false;
+    this.blocked = this.queue?.blocked ?? false;
     this.activeId = this.queue?.activeId ?? null;
     this.lastDone = this.queue?.lastDone ?? null;
     if (!this.items.some((i) => i.id === this.stage?.id)) this.stage = null;
@@ -136,6 +139,7 @@ class Uploads {
     this.items = [];
     this.completed = 0;
     this.struggling = false;
+    this.blocked = false;
     this.stage = null;
     this.activeId = null;
     this.lastDone = null;

@@ -480,6 +480,14 @@
           μόλις γυρίσει το σήμα. Μην κλείσεις την εφαρμογή.
         </span>
       </div>
+    {:else if uploads.blocked}
+      <div class="banner banner-warn">
+        <strong>Η εφαρμογή είναι ανοιχτή και αλλού</strong>
+        <span>
+          Ένα άλλο παράθυρο ή καρτέλα κρατάει το ανέβασμα. Κλείσ' το και αυτές εδώ θα
+          ξεκινήσουν μόνες τους.
+        </span>
+      </div>
     {:else if struggling}
       <div class="banner banner-warn">
         <strong>Το δίκτυο είναι αργό</strong>
