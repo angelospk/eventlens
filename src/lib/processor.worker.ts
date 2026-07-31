@@ -183,10 +183,23 @@ async function loadable<T>(load: () => Promise<T>, what: string): Promise<T> {
 
 async function decode(blob: Blob): Promise<ImageBitmap> {
   try {
-    return await createImageBitmap(blob);
+    // Orientation asked for explicitly rather than left to the default, which is the one
+    // thing here that has genuinely differed between browsers. A phone held sideways
+    // records the rotation in EXIF instead of in the pixels, so getting this wrong puts
+    // half a night on the wall lying on its side — on some devices and not others.
+    return await createImageBitmap(blob, { imageOrientation: 'from-image' });
   } catch (nativeError) {
     const { isHeic, heicTo } = await loadable(() => import('heic-to/next'), 'HEIC decoder');
-    if (!(await isHeic(blob as File))) throw nativeError;
+    if (!(await isHeic(blob as File))) {
+      // Neither the browser nor the HEIC decoder knows this one. Measured in Chromium:
+      // JPEG, PNG, HEIC, GIF and BMP all decode; TIFF does not, and Safari's does. So the
+      // photographer needs to be told it is the *format*, not the photograph — otherwise
+      // "could not be processed" reads as a bug and they try the same file all night.
+      throw new Error(
+        `αυτός ο τύπος αρχείου (${blob.type || 'άγνωστος'}) δεν υποστηρίζεται σε αυτή τη συσκευή — ` +
+          'στείλ᾽ την σαν JPEG'
+      );
+    }
     const bitmap = await heicTo({ blob, type: 'bitmap' });
     if (!bitmap) throw nativeError;
     return bitmap as ImageBitmap;
