@@ -148,10 +148,31 @@ export class UploadQueue {
     return this.active;
   }
 
+  /**
+   * Anything still marked 'uploading' when a drain begins was interrupted, not running:
+   * the app was closed or killed mid-attempt. Left alone the interface shows several
+   * photographs uploading at once when the queue only ever works on one, which reads as
+   * everything being stuck.
+   */
+  private async reclaimInterrupted() {
+    try {
+      const stale = (await this.store.all()).filter(
+        (i) => i.status === 'uploading' && !this.inFlight.has(i.id)
+      );
+      for (const i of stale) {
+        await this.store.update(i.id, { status: 'pending', startedAt: undefined });
+      }
+      if (stale.length) this.onChange();
+    } catch {
+      // Not worth failing the drain over; the rows are retried regardless.
+    }
+  }
+
   private async run() {
     await this.withLock(async () => {
       this.running = true;
       try {
+        await this.reclaimInterrupted();
         do {
           this.dirty = false;
           // Items the store itself refused to touch this pass. Without this the loop would

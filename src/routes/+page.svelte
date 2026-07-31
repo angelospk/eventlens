@@ -57,6 +57,9 @@
   // The most recent photograph to land, kept so the first question on reopening the app
   // ("where did I get to") has an answer that a running total cannot give.
   let lastDone = $state<{ name: string; at: number; url: string } | null>(null);
+  // Rows whose bytes the device can no longer produce. Queued by an older version that
+  // kept a handle to the file rather than a copy of it, and orphaned by a reload.
+  let unreadable = $state<Record<string, boolean>>({});
   let skipped = $state('');
 
   // Recomputed on every tick rather than frozen at mount: an app left open across midnight
@@ -195,9 +198,19 @@
     try {
       for (const [i, file] of Array.from(files).entries()) {
         try {
+          // Copied into memory rather than queued as picked.
+          //
+          // A File from the picker is a handle to something on disk, and iOS revokes that
+          // handle when the app is reloaded or killed. The row survives in the database and
+          // the bytes do not: the thumbnail turns into a broken image and the upload can
+          // never read it. Taking a real copy costs the memory of one photograph for the
+          // moment it takes to store it, and makes the queue mean what it says.
+          const bytes = new Blob([await file.arrayBuffer()], {
+            type: file.type || 'image/jpeg'
+          });
           const outcome = await queue.enqueue({
             id: uuid(),
-            file,
+            file: bytes,
             originalName: file.name,
             eventDate,
             status: 'pending',
@@ -558,11 +571,20 @@
         {#each items as it (it.id)}
           {@const s = statusLabel(it)}
           <li class="row">
-            <img class="thumb" src={thumbs[it.id]} alt="" />
+            {#if unreadable[it.id]}
+              <div class="thumb thumb-gone" aria-hidden="true">!</div>
+            {:else}
+              <img class="thumb" src={thumbs[it.id]} alt=""
+                   onerror={() => (unreadable = { ...unreadable, [it.id]: true })} />
+            {/if}
             <div class="meta">
               <span class="name">{it.originalName}</span>
               <span class="chip {s.cls}">{s.text}</span>
-              {#if it.status === 'error' && it.lastError}
+              {#if unreadable[it.id]}
+                <span class="error">
+                  Το αρχείο δεν είναι πια διαθέσιμο στη συσκευή. Διάλεξέ το ξανά.
+                </span>
+              {:else if it.status === 'error' && it.lastError}
                 <span class="error">{it.lastError}</span>
               {:else if (it.tries ?? 0) > 1 && it.status !== 'uploading'}
                 <!-- A raw attempt count reads as an alarm. What the photographer needs to
@@ -570,7 +592,13 @@
                 <span class="hint" style="font-size:.75rem">Περιμένει δίκτυο, ξαναδοκιμάζει μόνο του</span>
               {/if}
             </div>
-            {#if it.status === 'error'}
+            {#if unreadable[it.id]}
+              <div class="row-actions">
+                <button class="btn btn-sm btn-danger" onclick={() => queue.cancel(it.id)}>
+                  Αφαίρεση
+                </button>
+              </div>
+            {:else if it.status === 'error'}
               <div class="row-actions">
                 <button class="btn btn-sm" onclick={() => queue.retryItem(it.id)}>Ξανά</button>
                 <button class="btn btn-sm btn-danger" onclick={() => queue.discard(it.id)}>Διαγραφή</button>
@@ -591,6 +619,15 @@
 </div>
 
 <style>
+  .thumb-gone {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: var(--danger-soft);
+    color: var(--danger);
+    font-weight: 700;
+  }
+
   .last-done {
     display: flex;
     align-items: center;

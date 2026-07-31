@@ -512,3 +512,22 @@ test('an upload records what went up last, for "where did I get to"', async () =
   expect(q.lastDone?.name).toBe('second.jpg');
   expect(q.lastDone?.at).toBeGreaterThan(0);
 });
+
+test('rows left mid-flight by a kill are put back in line, not shown as uploading', async () => {
+  // What the photographer saw: three photographs all claiming to upload at once, when the
+  // queue only ever works on one. They were interrupted, not running.
+  const store = new MemStore();
+  await store.add({ ...item('killed1'), status: 'uploading', startedAt: 1 });
+  await store.add({ ...item('killed2'), status: 'uploading', startedAt: 2 });
+
+  const uploaded: string[] = [];
+  const q = new UploadQueue(
+    store,
+    { async run(it: QueueItem) { uploaded.push(it.id); } },
+    { baseMs: 1, maxMs: 4, maxAttempts: 3 }
+  );
+  await q.drain();
+
+  expect(uploaded.sort()).toEqual(['killed1', 'killed2']);
+  expect(await store.all()).toEqual([]);
+});
